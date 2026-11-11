@@ -1,0 +1,8 @@
+{
+ "native_int_ms": 10.066349814997011,
+ "private_ms": 11.886179319999428,
+ "private_with_copies_ms": 16.04721858002449,
+ "private_v3_ms": 12.948968049995528,
+ "private_v3_with_copies_ms": 18.394978839969554,
+ "private_v3_pads_only_ms": 0.9518744350043562
+}

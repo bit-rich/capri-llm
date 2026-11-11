@@ -1,0 +1,10 @@
+# environments and build output
+.venv/
+__pycache__/
+*.so
+# large generated data: rebuild with quant4.py / hf_reference.py
+*.npz
+*.npy
+# third-party checkout used by pi/lattice_estimate.py
+lattice-estimator/
+est_*.json

@@ -1,0 +1,64 @@
+{
+ "model": "Qwen/Qwen3-8B",
+ "server_on_gpu": false,
+ "offline_on_gpu": true,
+ "tokens_forwarded": 134,
+ "prompts": [
+  {
+   "prompt": "The capital of France is",
+   "private_text": " Paris. The capital of Italy is Rome. The capital of Spain is Madrid. The capital of Germany is Berlin. The",
+   "private_eq_w8": true,
+   "min_w8_top2_margin": 0.024248123168945312,
+   "private_eq_hf": false,
+   "w8_eq_hf": false
+  },
+  {
+   "prompt": "def fibonacci(n):\n    \"\"\"Return the n-th Fibonacci number.\"\"\"\n",
+   "private_text": "    if n == 0:\n        return 0\n    elif n == 1:\n        return 1\n",
+   "private_eq_w8": true,
+   "min_w8_top2_margin": 0.6749343872070312,
+   "private_eq_hf": true,
+   "w8_eq_hf": true
+  },
+  {
+   "prompt": "Photosynthesis is the process by which",
+   "private_text": " plants, algae, and some bacteria convert light energy into chemical energy. This process is essential for life on Earth as it",
+   "private_eq_w8": true,
+   "min_w8_top2_margin": 0.08169937133789062,
+   "private_eq_hf": true,
+   "w8_eq_hf": true
+  },
+  {
+   "prompt": "<|im_start|>user\nName three primary colors.<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+   "private_text": "The three primary colors are:\n\n1. Red  \n2. Blue  \n3. Yellow  \n\nThese are the basic colors from",
+   "private_eq_w8": true,
+   "min_w8_top2_margin": 0.8669776916503906,
+   "private_eq_hf": true,
+   "w8_eq_hf": true
+  }
+ ],
+ "all_private_eq_w8": true,
+ "logits_rel_err_vs_w8_max": 0.03248927310270568,
+ "logits_rel_err_vs_w8_mean": 0.00595517310033641,
+ "server_online_s_per_tok": 0.6734281464179235,
+ "server_plain_int8_s_per_tok": 0.3831401996194031,
+ "online_overhead": 1.757654631612348,
+ "client_mask_s_per_tok": 0.07416633205211193,
+ "client_unmask_s_per_tok": 0.020779412007643137,
+ "private_total_s_per_tok_excl_network": 0.7830052937462787,
+ "rounds_per_tok": 145.0,
+ "online_up_KB_per_tok": 3555.328,
+ "online_down_KB_per_tok": 6211.072,
+ "offline_server_s_per_tok_amortized": 0.03711589128515691,
+ "offline_client_s_per_tok_amortized": 0.009037400754637936,
+ "offline_up_KB_per_tok": 23.04,
+ "offline_down_KB_per_tok": 11645.76,
+ "offline_server_s_batch": 152.0266907040027,
+ "offline_client_s_batch": 37.01719349099699,
+ "hint_setup_s": 201.06808706799984,
+ "D_total": 1552768,
+ "params": 7568097280,
+ "all_private_eq_hf": false,
+ "logits_rel_err_vs_hf_max": 0.2922445278729327,
+ "logits_rel_err_vs_hf_mean": 0.036788006599241294
+}

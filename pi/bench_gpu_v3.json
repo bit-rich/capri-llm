@@ -1,0 +1,10 @@
+{
+ "native_int_ms": 4.498577429994839,
+ "private_ms": 6.724512319997302,
+ "private_with_copies_ms": 11.399360079994949,
+ "private_v3_ms": 8.954408455001612,
+ "private_v3_with_copies_ms": 13.591798300003575,
+ "private_v3_pads_only_ms": 0.5821240250043047,
+ "native_bf16_ms": 5.814787960007379,
+ "hf_bf16_full_decode_step_ms": 11.756385669996234
+}

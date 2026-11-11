@@ -1,0 +1,70 @@
+{
+ "model": "Qwen/Qwen3-1.7B",
+ "server_on_gpu": true,
+ "offline_on_gpu": true,
+ "tokens_forwarded": 134,
+ "prompts": [
+  {
+   "prompt": "The capital of France is",
+   "private_text": " Paris. The capital of the United States is Washington, D.C. The capital of the United Kingdom is London. The",
+   "private_eq_w8": false,
+   "min_w8_top2_margin": 0.0057373046875,
+   "private_eq_hf": false,
+   "w8_eq_hf": true
+  },
+  {
+   "prompt": "def fibonacci(n):\n    \"\"\"Return the n-th Fibonacci number.\"\"\"\n",
+   "private_text": "    if n == 0:\n        return 0\n    elif n == 1:\n        return 1\n",
+   "private_eq_w8": true,
+   "min_w8_top2_margin": 0.22188377380371094,
+   "private_eq_hf": true,
+   "w8_eq_hf": true
+  },
+  {
+   "prompt": "Photosynthesis is the process by which",
+   "private_text": " plants and other organisms use sunlight to convert carbon dioxide and water into oxygen and glucose. This process is essential for life on",
+   "private_eq_w8": true,
+   "min_w8_top2_margin": 0.08494758605957031,
+   "private_eq_hf": false,
+   "w8_eq_hf": false
+  },
+  {
+   "prompt": "<|im_start|>user\nName three primary colors.<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+   "private_text": "The three primary colors are **red**, **blue**, and **yellow**.\n\nThese are the fundamental colors in",
+   "private_eq_w8": true,
+   "min_w8_top2_margin": 0.34538841247558594,
+   "private_eq_hf": false,
+   "w8_eq_hf": false
+  }
+ ],
+ "all_private_eq_w8": false,
+ "logits_rel_err_vs_w8_max": 0.034140413656671656,
+ "logits_rel_err_vs_w8_mean": 0.007490740764151133,
+ "server_online_s_per_tok": 0.03137746679036734,
+ "server_plain_int8_s_per_tok": 0.010285153611940627,
+ "online_overhead": 3.0507533454764775,
+ "client_mask_s_per_tok": 0.022317674777573914,
+ "client_unmask_s_per_tok": 0.006586725193287816,
+ "private_total_s_per_tok_excl_network": 0.06737223179854156,
+ "rounds_per_tok": 113.0,
+ "online_up_KB_per_tok": 1384.448,
+ "online_down_KB_per_tok": 1813.44,
+ "offline_server_s_per_tok_amortized": 4.533693420682994e-10,
+ "offline_client_s_per_tok_amortized": 0.001149256927731379,
+ "offline_up_KB_per_tok": 10.24,
+ "offline_down_KB_per_tok": 0.0,
+ "offline_server_s_batch": 1.8570008251117542e-06,
+ "offline_client_s_batch": 4.707356375987729,
+ "hint_setup_s": 0.16867149000063364,
+ "D_total": 725376,
+ "params": 1720451072,
+ "reply_bits": 20,
+ "client_offline_on_gpu": true,
+ "server_pads_s_per_tok": 0.0013435273954947567,
+ "offline_up_MB_batch": 41.94304,
+ "public_c1_server_s_once": 19.300211442003274,
+ "public_c1_download_GB_once": 11.884560384,
+ "all_private_eq_hf": false,
+ "logits_rel_err_vs_hf_max": 0.1796096457187695,
+ "logits_rel_err_vs_hf_mean": 0.044860859887483256
+}

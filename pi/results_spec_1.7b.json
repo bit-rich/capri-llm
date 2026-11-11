@@ -1,0 +1,174 @@
+{
+ "model": "Qwen/Qwen3-1.7B",
+ "draft": "Qwen/Qwen3-0.6B (HF fp32, cpu)",
+ "reply_bits": 20,
+ "k": 4,
+ "server_on_gpu": true,
+ "nets": {
+  "fiber": {
+   "round_trip_s": 0.01,
+   "down_bit_s": 1000000000.0,
+   "up_bit_s": 1000000000.0
+  },
+  "home": {
+   "round_trip_s": 0.03,
+   "down_bit_s": 100000000.0,
+   "up_bit_s": 20000000.0
+  }
+ },
+ "runs": {
+  "one token per pass": {
+   "whole_prompt": false,
+   "k": 0,
+   "private_eq_w8": [
+    true,
+    true,
+    false,
+    false
+   ],
+   "logits_rel_err_vs_w8_mean": 0.006611987128882548,
+   "logits_rel_err_vs_w8_max": 0.014644155635011492,
+   "texts": [
+    " Paris. The capital of the United States is Washington, D.C. The capital of the United Kingdom is London. The",
+    "    if n == 0:\n        return 0\n    elif n == 1:\n        return 1\n",
+    " green plants and some other organisms use sunlight to convert carbon dioxide and water into oxygen and glucose. This process is essential for",
+    "The three primary colors are **red**, **blue**, and **yellow**.\n\nThese are the fundamental colors in"
+   ],
+   "prompt_tokens": 42,
+   "generated_tokens": 92,
+   "passes": 92,
+   "tokens_per_pass": 1.0,
+   "guesses_kept": 0.0,
+   "prompt": {
+    "tokens": 42,
+    "wall_s": 3.5521849449996807,
+    "server_s": 1.5907338899305614,
+    "draft_s": 0.0,
+    "client_s": 1.9614510550691193,
+    "round_trips": 2436,
+    "up_MB": 58.146816,
+    "down_MB": 76.16448,
+    "secrets_used": 42,
+    "tok_per_s_no_network": 11.823708689245564,
+    "tok_per_s_fiber": 1.4489416101185024,
+    "tok_per_s_home": 0.3962859710997421
+   },
+   "gen": {
+    "tokens": 92,
+    "wall_s": 6.932625419998658,
+    "server_s": 3.1553690950204327,
+    "draft_s": 0.0,
+    "client_s": 3.777256324978225,
+    "round_trips": 5336,
+    "up_MB": 127.369216,
+    "down_MB": 166.83648,
+    "secrets_used": 92,
+    "tok_per_s_no_network": 13.270585734317347,
+    "tok_per_s_fiber": 1.4685630692627296,
+    "tok_per_s_home": 0.3977394044816406
+   }
+  },
+  "whole prompt": {
+   "whole_prompt": true,
+   "k": 0,
+   "private_eq_w8": [
+    true,
+    true,
+    true,
+    false
+   ],
+   "logits_rel_err_vs_w8_mean": 0.008059786074329545,
+   "logits_rel_err_vs_w8_max": 0.032176324806098076,
+   "texts": [
+    " Paris. The capital of the United States is Washington, D.C. The capital of the United Kingdom is London. The",
+    "    if n == 0:\n        return 0\n    elif n == 1:\n        return 1\n",
+    " green plants and some other organisms use sunlight to synthesize food, usually glucose, and release oxygen. This process is essential",
+    "The three primary colors are **red**, **blue**, and **yellow**.\n\nThese are the fundamental colors in"
+   ],
+   "prompt_tokens": 42,
+   "generated_tokens": 92,
+   "passes": 92,
+   "tokens_per_pass": 1.0,
+   "guesses_kept": 0.0,
+   "prompt": {
+    "tokens": 42,
+    "wall_s": 1.3007883640038926,
+    "server_s": 0.4394655460091599,
+    "draft_s": 0.0,
+    "client_s": 0.8613228179947328,
+    "round_trips": 232,
+    "up_MB": 57.83552,
+    "down_MB": 61.73056,
+    "secrets_used": 42,
+    "tok_per_s_no_network": 32.288111703830026,
+    "tok_per_s_fiber": 9.175680854802401,
+    "tok_per_s_home": 1.155959872075372
+   },
+   "gen": {
+    "tokens": 92,
+    "wall_s": 8.147746459999325,
+    "server_s": 3.56094844499421,
+    "draft_s": 0.0,
+    "client_s": 4.586798015005115,
+    "round_trips": 5336,
+    "up_MB": 127.369216,
+    "down_MB": 166.83648,
+    "secrets_used": 92,
+    "tok_per_s_no_network": 11.291465738614505,
+    "tok_per_s_fiber": 1.4406200221827863,
+    "tok_per_s_home": 0.3956608880886829
+   }
+  },
+  "whole prompt + speculative k=4": {
+   "whole_prompt": true,
+   "k": 4,
+   "private_eq_w8": [
+    true,
+    true,
+    true,
+    true
+   ],
+   "logits_rel_err_vs_w8_mean": 0.007909853964131424,
+   "logits_rel_err_vs_w8_max": 0.03391607999287804,
+   "texts": [
+    " Paris. The capital of the United States is Washington, D.C. The capital of the United Kingdom is London. The",
+    "    if n == 0:\n        return 0\n    elif n == 1:\n        return 1\n",
+    " green plants and some other organisms use sunlight to synthesize food, usually glucose, and release oxygen. This process is essential",
+    "The three primary colors are **red**, **blue**, and **yellow**. These are the fundamental colors in the traditional"
+   ],
+   "prompt_tokens": 42,
+   "generated_tokens": 92,
+   "passes": 31,
+   "tokens_per_pass": 2.967741935483871,
+   "guesses_kept": 0.5648148148148148,
+   "prompt": {
+    "tokens": 42,
+    "wall_s": 1.1469734939983027,
+    "server_s": 0.43217852097950527,
+    "draft_s": 0.0,
+    "client_s": 0.7147949730187975,
+    "round_trips": 232,
+    "up_MB": 57.83552,
+    "down_MB": 61.73056,
+    "secrets_used": 42,
+    "tok_per_s_no_network": 36.6181086309063,
+    "tok_per_s_fiber": 9.494739400529498,
+    "tok_per_s_home": 1.1608743456525756
+   },
+   "gen": {
+    "tokens": 92,
+    "wall_s": 11.208183814998847,
+    "server_s": 2.197034725009871,
+    "draft_s": 5.224404485994455,
+    "client_s": 9.011149089988976,
+    "round_trips": 1798,
+    "up_MB": 192.438272,
+    "down_MB": 252.06816,
+    "secrets_used": 139,
+    "tok_per_s_no_network": 8.208287936613347,
+    "tok_per_s_fiber": 2.8096548671418575,
+    "tok_per_s_home": 0.566890121596029
+   }
+  }
+ }
+}

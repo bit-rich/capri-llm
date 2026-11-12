@@ -176,14 +176,44 @@ Measured on Qwen3-1.7B (v3 + merge, 20-bit reply, 4 prompts of 42 tokens in tota
 - `fold.py`: v3 crypto (public one-time `C1'`, per-token pads, per-batch upload `b`, 16-bit reply); `test_v3.py` checks it against exact big-integer arithmetic
 - `protocol.py`: Qwen3 model (safetensors loader), client, server (`Server`/`Client` = v2, `FoldServer`/`FoldClient` = v3)
 - `spec.py [1.7b] [k=N] [bits=N] [draftgpu]`: whole-prompt passes and speculative decoding on v3 + merge, written to `results_spec*.json`
+- `server.py`, `client.py`, `net.py`: the same protocol as two programs over TCP
+- `plan.py <HF id>`: sizes of a run (GPU memory, data per token, round trips) from the model's config alone
+- `test_mistral.py`: Mistral3 / FP8 loader and forward pass against HF on a tiny random model
 - `prompts.py`, `hf_reference.py`: prompts, the calibration text for `merge`, and the HF transformers fp32 greedy reference (`hf_reference.json`, `hf_logits.npy`)
 - `kernels.c`: int8 GEMV kernels
-- `run.py [v2|v3] [merge] [4b|8b] [w4] [cpu] [bits=N] [cpuclient]`: end-to-end run (`merge` = 2 round trips per block; v2/v3 put the server GEMVs and the offline or one-time step on the GPU when CUDA is available, unless `cpu` is given; `bits=N` sets the v3 reply width, `cpuclient` keeps the v3 client off the GPU). Results go to `results_qwen*_v2.json` / `results_qwen*_v3.json`
+- `run.py [v2|v3] [merge] [1.7b|4b|8b|repo=<HF id>] [w4] [cpu] [bits=N] [cpuclient] [gpuload] [prompts=N] [new=N] [calib=N] [nobase]`: end-to-end run (`merge` = 2 round trips per block; v2/v3 put the server GEMVs and the offline or one-time step on the GPU when CUDA is available, unless `cpu` is given; `bits=N` sets the v3 reply width, `cpuclient` keeps the v3 client off the GPU). Results go to `results_qwen*_v2.json` / `results_qwen*_v3.json`
 - `bench_gpu.py [merge]`: same-GPU timing of private (v2 and v3) vs native int8/bf16 server work, written to `bench_gpu*_v3.json`
 - `costmodel.py`, `qwen_cost.py`: per-token projections for 7B, 70B, DeepSeek-V3 and larger Qwen models. These still model v2 (7.5 offline bytes and 4 online bytes per row and token)
 - `test_*.py`: correctness tests
 
 Build: `gcc -O3 -march=native -shared -fPIC kernels.c -o libk.so`, then in a venv with numpy, tokenizers, huggingface_hub (+ torch, transformers for the GPU path and the reference): `python hf_reference.py && python run.py v3`
+
+## Over a real network (`server.py`, `client.py`, `net.py`)
+`server.py` and `client.py` are separate programs on one TCP connection (v3 + merge, whole prompt in one pass, optional speculative `k=N`).
+The client receives a public bundle (config, norms, per-row scales, embedding table, tokenizer) and the one-time `C1'` (`cache=DIR`
+keeps both on disk), uploads `b`, and from then on sends only masked activations. Messages are JSON headers plus raw numeric arrays;
+nothing is unpickled. The client derives all public randomness from its own fixed seeds and refuses a server that uses others, since
+a server choosing the `a`'s could disable the masks. `check` (tests only) sends the tokens in the clear afterwards to compare with the
+server's plain W8 model. The server has no authentication: bind it to 127.0.0.1 or firewall it to the client's address.
+
+    python server.py bits=20                    # Qwen3-0.6B; repo=<HF id>, 1.7b, 4b, gpuload, host=, port=
+    python client.py host=<server> check        # prompts=N new=N k=N cache=DIR label=NAME
+
+Localhost, Qwen3-0.6B, 20-bit replies, 4 prompts x 24 new tokens: private == plain W8 on 4 of 4. First token after 0.23-0.42 s,
+9.1-10.1 tokens/s while writing, 58 round trips per token, about 1.4 MB up and 1.5 MB down per token. One-time: 8.1 GB `C1'`, 19 s.
+
+## Other and bigger models (`run.py repo=<HF id>`, `plan.py`, `test_mistral.py`)
+- The loader also reads Mistral3 text models (checked for `mistralai/Mistral-Medium-3.5-128B`: 88 layers, d = 12288, FP8 weights with a
+  per-tensor `weight_scale_inv`, YaRN RoPE, no q/k norm, tensors under `model.language_model.`). `test_mistral.py` writes a tiny random
+  model in that exact file layout and matches HF `Ministral3ForCausalLM` logits to 1e-6, merged and batched included.
+- `plan.py <HF id>` prints the sizes of a run from `config.json` alone. For Mistral-Medium-3.5-128B with `merge`: 178 round trips per
+  pass, 247.6 GB of int8 weights on the GPUs (123.4 GB and 353 trips without `merge`), 23 MB up and 21.5 MB down per token at
+  `bits=20`, `C1'` 141 GB (streamed).
+- For big models: `gpuload` decodes, merges and quantizes the weights on the GPU (the numpy path would take hours), the server spreads
+  the layers over all visible GPUs, `prompts=N new=N calib=N` shorten the test, `nobase` skips the native baseline (a second load).
+  Example: `python run.py v3 merge repo=mistralai/Mistral-Medium-3.5-128B bits=20 gpuload prompts=2 new=12 calib=24 nobase`
+- Not run at that size yet. The multi-GPU placement has only run on one GPU, there is no HF reference for the 128B model (only private
+  vs W8), and `spec.py` has no draft model for the Mistral tokenizer.
 
 ## Security estimates (`lattice_estimate.py`, malb/lattice-estimator commit 7d59f86)
 Bits of work for the best attack found. "Full" is the estimator's default cost model, "lower bound" is its `rough` mode (core-SVP).

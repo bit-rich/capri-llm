@@ -6,7 +6,7 @@ mask secrets (offline). It runs plain int8 GEMVs online. Client does masking, un
 the embedding lookup (public table), RMSNorm/RoPE/SwiGLU gating/softmax/GQA attention,
 and holds the KV cache.
 """
-import ctypes, glob, json, os, time, numpy as np
+import ctypes, glob, json, math, os, time, numpy as np
 from crypto import (InnerLWE, BFV, BFV32, offline_hint_products, offline_hint_products_v2,
                     offline_hint_products_v2_gpu, gpu_available, dgauss, Q32)
 
@@ -22,6 +22,16 @@ def gemv_u32(W, c):
 def gemv_i8(W, x):
     y = np.empty(W.shape[0], dtype=np.int32); x = np.ascontiguousarray(x, dtype=np.int8)
     lib.gemv_i8_i8(W.ctypes.data, x.ctypes.data, y.ctypes.data, W.shape[0], W.shape[1]); return y
+
+def gpu_free():
+    """Bytes usable for weights on each GPU: 6% is kept back for the GEMM workspaces, and on big cards the first GPU
+    keeps another 4 GB for the per-token pads."""
+    import torch
+    out = []
+    for i in range(torch.cuda.device_count()):
+        free, total = torch.cuda.mem_get_info(i)
+        out.append(int(free - 0.06 * total - ((4 << 30) if i == 0 and total > (16 << 30) else 0)))
+    return out
 
 _SHIFTS = {}
 def gemv_u32_gpu(W, c):
@@ -69,7 +79,10 @@ class SafeTensors:
     nothing is held in memory beyond the memmaps, so big models load one tensor at a time."""
     def __init__(self, path):
         self.meta = {}
-        for f in sorted(glob.glob(os.path.join(path, "*.safetensors"))):
+        idx = os.path.join(path, "model.safetensors.index.json")   # sharded: only the shards it lists (a repo may hold other copies)
+        files = (sorted(os.path.join(path, f) for f in set(json.load(open(idx))["weight_map"].values())) if os.path.exists(idx)
+                 else sorted(glob.glob(os.path.join(path, "*.safetensors"))))
+        for f in files:
             with open(f, "rb") as fh:
                 n = int.from_bytes(fh.read(8), "little"); hdr = json.loads(fh.read(n))
             raw = np.memmap(f, dtype=np.uint8, mode="r", offset=8 + n)
@@ -82,7 +95,46 @@ class SafeTensors:
         raw, v = self.meta[k]; b = raw[v["data_offsets"][0]:v["data_offsets"][1]]
         if v["dtype"] == "BF16": return bf16_to_f32(b.view(np.uint16)).reshape(v["shape"])
         if v["dtype"] == "F32": return np.array(b.view(np.float32)).reshape(v["shape"])
+        if v["dtype"] == "F8_E4M3":              # FP8 checkpoints: real weight = fp8 value * <name>_scale_inv (one scalar per tensor)
+            s = self[k + "_scale_inv"]; assert s.size == 1, "only per-tensor FP8 scales are supported"
+            return (F8_E4M3[b] * np.float32(s.reshape(-1)[0])).reshape(v["shape"])
         raise ValueError(v["dtype"])
+
+def _st_get(self, k, dev=None):
+    """Tensor k as float32: numpy, or with dev a torch tensor decoded on that device (fast path for big models)."""
+    if dev is None: return self[k]
+    import torch
+    raw, v = self.meta[k]; b = torch.from_numpy(np.array(raw[v["data_offsets"][0]:v["data_offsets"][1]])).to(dev)
+    if v["dtype"] == "BF16": t = b.view(torch.bfloat16).float()
+    elif v["dtype"] == "F32": t = b.view(torch.float32)
+    elif v["dtype"] == "F8_E4M3": t = torch.as_tensor(F8_E4M3, device=dev)[b.long()] * float(np.float32(self[k + "_scale_inv"].reshape(-1)[0]))
+    else: raise ValueError(v["dtype"])
+    return t.reshape(v["shape"])
+SafeTensors.get = _st_get
+
+def _f8_e4m3_table():
+    """All 256 float8_e4m3fn values: 1 sign bit, 4 exponent bits (bias 7), 3 mantissa bits, subnormals, no infinities."""
+    b = np.arange(256); e, m = (b >> 3) & 15, b & 7
+    v = np.where(e == 0, m / 8 * 2.0 ** -6, (1 + m / 8) * 2.0 ** (e - 7.0))
+    v[(b & 127) == 127] = np.nan
+    return np.where(b >= 128, -v, v).astype(np.float32)
+F8_E4M3 = _f8_e4m3_table()
+
+def yarn_rope(rp, hd, max_pos):
+    """YaRN RoPE as in transformers' _compute_yarn_parameters: (inverse frequencies, factor applied to cos and sin)."""
+    base, orig = rp["rope_theta"], rp["original_max_position_embeddings"]
+    factor = rp.get("factor") or max_pos / orig
+    ms = lambda s, m=1: 1.0 if s <= 1 else 0.1 * m * math.log(s) + 1.0
+    att = rp.get("attention_factor")
+    if att is None:
+        att = ms(factor, rp["mscale"]) / ms(factor, rp["mscale_all_dim"]) if rp.get("mscale") and rp.get("mscale_all_dim") else ms(factor)
+    cd = lambda rot: hd * math.log(orig / (rot * 2 * math.pi)) / (2 * math.log(base))
+    low, high = cd(rp.get("beta_fast") or 32), cd(rp.get("beta_slow") or 1)
+    if rp.get("truncate", True): low, high = math.floor(low), math.ceil(high)
+    low, high = max(low, 0), min(high, hd - 1)
+    ramp = np.clip((np.arange(hd // 2) - low) / ((high if high != low else high + 0.001) - low), 0, 1)
+    pf = base ** (np.arange(0, hd, 2) / hd)
+    return ramp / (factor * pf) + (1 - ramp) / pf, att
 
 def qwen_path(repo="Qwen/Qwen3-0.6B"):
     for p in glob.glob(os.path.expanduser(f"~/.cache/huggingface/hub/models--{repo.replace('/', '--')}/snapshots/*")):
@@ -90,12 +142,23 @@ def qwen_path(repo="Qwen/Qwen3-0.6B"):
         shards = set(json.load(open(idx))["weight_map"].values()) if os.path.exists(idx) else {"model.safetensors"}
         if all(os.path.exists(os.path.join(p, f)) for f in shards): return p
     from huggingface_hub import snapshot_download
-    return snapshot_download(repo, allow_patterns=["*.json", "*.safetensors", "*.txt"])
+    return snapshot_download(repo, allow_patterns=["*.json", "*.txt", "model*.safetensors"])   # not other copies of the weights
 
 
 # ---------------------------------------------------------------- model
 class Linear:
     def __init__(self, W, keep_float=True):     # W float (d_out, d_in) -> per-row int8
+        if not isinstance(W, np.ndarray):        # torch tensor on a GPU: same arithmetic there, int8 result back in host RAM
+            import torch
+            assert not keep_float
+            sc = W.abs().amax(1).clamp_min(1e-30) / 127.0
+            self.q, nm = np.empty(tuple(W.shape), dtype=np.int8), 0.0
+            for r in range(0, W.shape[0], 8192):
+                q = (W[r:r + 8192] / sc[r:r + 8192, None]).round_().clamp_(-127, 127)
+                nm = max(nm, float(q.double().square_().sum(1).sqrt_().max()))
+                self.q[r:r + 8192] = q.to(torch.int8).cpu().numpy()
+            self.W, self.scale, self.row_norm_max, self._t, self.packed = None, sc.cpu().numpy(), nm, None, None
+            return
         self.W = W.astype(np.float32) if keep_float else None   # unquantized, for the fp32 reference only
         self.scale = np.maximum(np.abs(W).max(1), 1e-30) / 127.0
         self.q = np.empty(W.shape, dtype=np.int8); norms = []
@@ -109,7 +172,8 @@ class Linear:
         """Pre-quantized weights, e.g. 4-bit GPTQ from quant4.py (q = integer levels stored as int8)."""
         L = cls.__new__(cls)
         L.W, L.q, L.scale, L.packed, L._t = None, q, scale, packed, None
-        L.row_norm_max = np.sqrt((q.astype(np.float32) ** 2).sum(1, dtype=np.float64)).max()
+        L.row_norm_max = max(np.sqrt((q[r:r + 8192].astype(np.float32) ** 2).sum(1, dtype=np.float64)).max()
+                             for r in range(0, q.shape[0], 8192))
         return L
     def plain(self, x):                          # plaintext W8 reference (float activations, fp32 accumulate)
         import torch                             # CPU int8-weight kernel: no dequantized copy of the weights
@@ -133,6 +197,15 @@ def merged_linear(R, G, w, keep_float, boost=1.0):
     The v-columns are divided by lam (the client sends lam * v). For one row the weight quantization error is smallest
     at lam = max|G diag(w) R| / max|G|; lam is the median of that over rows, times `boost` (>= 1, calibrated by
     merge_boost so that lam * v is not small next to w x, which would bury the R v rows in the protocol noise)."""
+    if not isinstance(R, np.ndarray):            # torch tensors on a GPU (big models): quantize the two row groups there
+        import torch
+        P = (G * w) @ R
+        lam = float(np.median((P.abs().amax(1) / G.abs().amax(1)).cpu().numpy())) * boost
+        top = Linear(torch.cat([R / lam, torch.zeros((R.shape[0], G.shape[1]), device=R.device)], 1), False)
+        bot = Linear(torch.cat([P / lam, G], 1), False); del P
+        L = Linear.from_int(np.concatenate([top.q, bot.q]), np.concatenate([top.scale, bot.scale]))
+        L.row_norm_max = max(top.row_norm_max, bot.row_norm_max)
+        return L, lam
     P = (G * w) @ R
     lam = float(np.median(np.abs(P).max(1) / np.abs(G).max(1))) * boost
     top = np.concatenate([R / lam, np.zeros((R.shape[0], G.shape[1]), np.float32)], 1)
@@ -152,40 +225,52 @@ def merge_boost(m, ids):
     return {k: max(1.0, float(np.median(v))) for k, v in seen.items()}
 
 class Qwen3:
-    def __init__(self, path=None, keep_float=True, w4=None, merge=False, boost=None):
+    """Decoder-only LM in HF safetensors layout with RMSNorm, SwiGLU, RoPE and GQA: Qwen3 (per-head q/k RMSNorm), and
+    Mistral3 text models (no q/k norm, YaRN RoPE, FP8 weights, tensors under model.language_model.)."""
+    def __init__(self, path=None, keep_float=True, w4=None, merge=False, boost=None, dev=None):
+        """dev (e.g. "cuda"): decode, merge and quantize the weights on that GPU instead of in numpy (needs keep_float=False).
+        Same arithmetic; meant for big models, where the numpy path takes hours."""
         path = path or qwen_path()
         w4 = np.load(w4) if w4 else None                         # quant4.py output: GPTQ 4-bit block linears
-        cfg = json.load(open(os.path.join(path, "config.json")))
+        cfg = json.load(open(os.path.join(path, "config.json"))); cfg = cfg.get("text_config", cfg)
         W = SafeTensors(path)
+        M = "model.language_model." if "model.language_model.norm.weight" in W else "model."
         self.d, self.L, self.vocab = cfg["hidden_size"], cfg["num_hidden_layers"], cfg["vocab_size"]
-        self.hq, self.hkv, self.hd = cfg["num_attention_heads"], cfg["num_key_value_heads"], cfg["head_dim"]
-        self.eps, theta = cfg["rms_norm_eps"], cfg["rope_theta"]
-        self.inv_freq = theta ** (-np.arange(0, self.hd, 2) / self.hd)
+        self.hq, self.hkv = cfg["num_attention_heads"], cfg["num_key_value_heads"]
+        self.hd = cfg.get("head_dim") or self.d // self.hq
+        self.eps, rp = cfg["rms_norm_eps"], cfg.get("rope_parameters") or dict(rope_theta=cfg.get("rope_theta"))
+        assert not rp.get("llama_4_scaling_beta") and not cfg.get("sliding_window"), "not implemented"
+        if rp.get("rope_type", "default") == "yarn": self.inv_freq, self.rope_scale = yarn_rope(rp, self.hd, cfg["max_position_embeddings"])
+        else: self.inv_freq, self.rope_scale = rp["rope_theta"] ** (-np.arange(0, self.hd, 2) / self.hd), 1.0
         f64 = lambda k: W[k].astype(np.float64)
-        lin = lambda *ks: Linear(np.concatenate([W[k] for k in ks]) if len(ks) > 1 else W[ks[0]], keep_float)
+        def cat(*ks):                            # block weights: numpy float32, or torch float32 on dev
+            ws = [W.get(k, dev) for k in ks]
+            return ws[0] if len(ws) == 1 else np.concatenate(ws) if dev is None else __import__("torch").cat(ws)
+        vec = lambda k: W.get(k, dev)            # norm weight in the same form
+        lin = lambda *ks: Linear(cat(*ks), keep_float)
         if w4 is not None:
             lin4 = lambda key: Linear.from_int(unpack4(w4[key + ".packed"]), w4[key + ".scale"], w4[key + ".packed"])
-        self.embed = W.raw("model.embed_tokens.weight")          # public table (bf16 memmap); client looks up its row
+        self.embed = W.raw(M + "embed_tokens.weight")          # public table (bf16 memmap); client looks up its row
         self.blocks = []; self.merged = merge
-        cat = lambda *ks: np.concatenate([W[k] for k in ks])
+        qk = lambda a: dict(q_norm=f64(a + "q_norm.weight"), k_norm=f64(a + "k_norm.weight")) if a + "q_norm.weight" in W else {}
         for i in range(self.L if merge else 0):  # 2 round trips per block: o+gate_up ("ob") and down+next qkv ("da")
             assert w4 is None, "merge needs the float weights"
-            p = f"model.layers.{i}."; a, m = p + "self_attn.", p + "mlp."; nx = f"model.layers.{i + 1}."
+            p = f"{M}layers.{i}."; a, m = p + "self_attn.", p + "mlp."; nx = f"{M}layers.{i + 1}."
             b = dict(qkv=lin(a + "q_proj.weight", a + "k_proj.weight", a + "v_proj.weight")) if i == 0 else {}
             bo = lambda k: (boost or {}).get(f"{i}.{k}", 1.0)
-            b["ob"], b["lam_ob"] = merged_linear(W[a + "o_proj.weight"], cat(m + "gate_proj.weight", m + "up_proj.weight"),
-                                                 W[p + "post_attention_layernorm.weight"], keep_float, bo("ob"))
+            b["ob"], b["lam_ob"] = merged_linear(cat(a + "o_proj.weight"), cat(m + "gate_proj.weight", m + "up_proj.weight"),
+                                                 vec(p + "post_attention_layernorm.weight"), keep_float, bo("ob"))
             b["w_ob"] = f64(p + "post_attention_layernorm.weight")
             if i < self.L - 1:
                 b["da"], b["lam_da"] = merged_linear(
-                    W[m + "down_proj.weight"], cat(nx + "self_attn.q_proj.weight", nx + "self_attn.k_proj.weight",
-                                                   nx + "self_attn.v_proj.weight"), W[nx + "input_layernorm.weight"], keep_float, bo("da"))
+                    cat(m + "down_proj.weight"), cat(nx + "self_attn.q_proj.weight", nx + "self_attn.k_proj.weight",
+                                                     nx + "self_attn.v_proj.weight"), vec(nx + "input_layernorm.weight"), keep_float, bo("da"))
                 b["w_da"] = f64(nx + "input_layernorm.weight")
             else: b["down"] = lin(m + "down_proj.weight")
-            b.update(ln1=f64(p + "input_layernorm.weight"), q_norm=f64(a + "q_norm.weight"), k_norm=f64(a + "k_norm.weight"))
+            b.update(ln1=f64(p + "input_layernorm.weight"), **qk(a))
             self.blocks.append(b)
         for i in range(0 if merge else self.L):
-            p = f"model.layers.{i}."; a, m = p + "self_attn.", p + "mlp."
+            p = f"{M}layers.{i}."; a, m = p + "self_attn.", p + "mlp."
             self.blocks.append(dict(
                 qkv=lin(a + "q_proj.weight", a + "k_proj.weight", a + "v_proj.weight"),
                 o=lin(a + "o_proj.weight"),
@@ -193,10 +278,9 @@ class Qwen3:
                 down=lin(m + "down_proj.weight"),
             ) if w4 is None else {k: lin4(f"{i}.{k}") for k in ("qkv", "o", "gate_up", "down")})
             self.blocks[-1].update(
-                ln1=f64(p + "input_layernorm.weight"), ln2=f64(p + "post_attention_layernorm.weight"),
-                q_norm=f64(a + "q_norm.weight"), k_norm=f64(a + "k_norm.weight"))
-        self.norm = f64("model.norm.weight")
-        self.head = lin("lm_head.weight" if "lm_head.weight" in W else "model.embed_tokens.weight")
+                ln1=f64(p + "input_layernorm.weight"), ln2=f64(p + "post_attention_layernorm.weight"), **qk(a))
+        self.norm = f64(M + "norm.weight")
+        self.head = lin("lm_head.weight" if "lm_head.weight" in W else M + "embed_tokens.weight")
     def linears(self):
         out = []
         for i, b in enumerate(self.blocks):
@@ -214,15 +298,16 @@ def attend(q, K, V):
 def forward_token(m, tok, cache, lin):
     """One decode step. `lin(name, layer, x)` performs the linear layer (plain or private)."""
     pos = len(cache[0][0])
-    ang = np.concatenate([pos * m.inv_freq] * 2); cos, sin = np.cos(ang), np.sin(ang)
+    ang = np.concatenate([pos * m.inv_freq] * 2); cos, sin = np.cos(ang) * m.rope_scale, np.sin(ang) * m.rope_scale
+    qkn = lambda x, b, k: rmsnorm(x, b[k], m.eps) if k in b else x          # Qwen3 normalises q and k per head
     x = bf16_to_f32(m.embed[tok]).astype(np.float64)
     nq, nk = m.hq * m.hd, m.hkv * m.hd
     rms = lambda x: np.sqrt((x * x).mean() + m.eps)
     for i, b in enumerate(m.blocks if m.merged else []):
         if i == 0: qkv = lin("0.qkv", b["qkv"], rmsnorm(x, b["ln1"], m.eps))
         q, k, v = np.split(qkv, [nq, nq + nk])
-        q = rope(rmsnorm(q.reshape(m.hq, m.hd), b["q_norm"], m.eps), cos, sin)
-        k = rope(rmsnorm(k.reshape(m.hkv, m.hd), b["k_norm"], m.eps), cos, sin)
+        q = rope(qkn(q.reshape(m.hq, m.hd), b, "q_norm"), cos, sin)
+        k = rope(qkn(k.reshape(m.hkv, m.hd), b, "k_norm"), cos, sin)
         cache[i][0].append(k); cache[i][1].append(v.reshape(m.hkv, m.hd))
         a = attend(q, np.array(cache[i][0]), np.array(cache[i][1]))
         out = lin(f"{i}.ob", b["ob"], np.concatenate([b["lam_ob"] * a, b["w_ob"] * x]))              # o, add, norm, gate_up
@@ -234,8 +319,8 @@ def forward_token(m, tok, cache, lin):
     for i, b in enumerate([] if m.merged else m.blocks):
         qkv = lin(f"{i}.qkv", b["qkv"], rmsnorm(x, b["ln1"], m.eps))
         q, k, v = np.split(qkv, [nq, nq + nk])
-        q = rope(rmsnorm(q.reshape(m.hq, m.hd), b["q_norm"], m.eps), cos, sin)
-        k = rope(rmsnorm(k.reshape(m.hkv, m.hd), b["k_norm"], m.eps), cos, sin)
+        q = rope(qkn(q.reshape(m.hq, m.hd), b, "q_norm"), cos, sin)
+        k = rope(qkn(k.reshape(m.hkv, m.hd), b, "k_norm"), cos, sin)
         cache[i][0].append(k); cache[i][1].append(v.reshape(m.hkv, m.hd))
         a = attend(q, np.array(cache[i][0]), np.array(cache[i][1]))
         x = x + lin(f"{i}.o", b["o"], a)
@@ -251,15 +336,16 @@ def forward_batch(m, toks, cache, lin, n_head=None):
     assert m.merged
     T, t0 = len(toks), len(cache[0][0])
     ang = (t0 + np.arange(T))[:, None] * np.concatenate([m.inv_freq] * 2)[None]
-    cos, sin = np.cos(ang)[:, None], np.sin(ang)[:, None]                              # (T, 1, hd)
+    cos, sin = np.cos(ang)[:, None] * m.rope_scale, np.sin(ang)[:, None] * m.rope_scale    # (T, 1, hd)
+    qkn = lambda x, b, k: rmsnorm(x, b[k], m.eps) if k in b else x
     x = np.stack([bf16_to_f32(m.embed[t]) for t in toks]).astype(np.float64)
     nq, nk = m.hq * m.hd, m.hkv * m.hd
     rms = lambda x: np.sqrt((x * x).mean(-1, keepdims=True) + m.eps)
     for i, b in enumerate(m.blocks):
         if i == 0: qkv = lin("0.qkv", b["qkv"], rmsnorm(x, b["ln1"], m.eps))
         q, k, v = np.split(qkv, [nq, nq + nk], axis=1)
-        q = rope(rmsnorm(q.reshape(T, m.hq, m.hd), b["q_norm"], m.eps), cos, sin)
-        k = rope(rmsnorm(k.reshape(T, m.hkv, m.hd), b["k_norm"], m.eps), cos, sin)
+        q = rope(qkn(q.reshape(T, m.hq, m.hd), b, "q_norm"), cos, sin)
+        k = rope(qkn(k.reshape(T, m.hkv, m.hd), b, "k_norm"), cos, sin)
         cache[i][0].extend(k); cache[i][1].extend(v.reshape(T, m.hkv, m.hd))
         K, V = np.array(cache[i][0]), np.array(cache[i][1])
         a = np.stack([attend(q[j], K[:t0 + j + 1], V[:t0 + j + 1]) for j in range(T)])
@@ -293,16 +379,22 @@ class Server:
             self.H[name] = self.H_all[off:off + q.shape[0]]; off += q.shape[0]
         self.time_online = 0.0
     def upload_gpu(self):
-        """Weights to the GPU (after the offline phase, which needs the GPU memory). 4-bit stays packed there."""
+        """Weights to the GPU(s) (after the offline phase, which needs the GPU memory). 4-bit stays packed there.
+        Layers go to the GPUs in order, moving on when one is full, so each GEMV runs where its weights are."""
         import torch
-        self.Wg = {n: torch.as_tensor(L.packed if L.packed is not None else L.q, device="cuda") for n, L in self.lin.items()}
+        self.Wg = None; torch.cuda.empty_cache()
+        free = gpu_free(); dev = 0; self.Wg = {}
+        for n, L in self.lin.items():
+            w = L.packed if L.packed is not None else L.q
+            while w.nbytes > free[dev] and dev + 1 < len(free): dev += 1
+            self.Wg[n] = torch.as_tensor(w, device=f"cuda:{dev}"); free[dev] -= w.nbytes
     def weight_gpu(self, name):                  # int8 view for the GEMM (4-bit: unpacked on the fly, every call)
         return unpack4(self.Wg[name]) if self.lin[name].packed is not None else self.Wg[name]
     def online(self, name, c):
         t = time.perf_counter()
         if self.gpu:   # time includes host<->GPU copies of c and y (they arrive/leave over the network)
             import torch
-            y = gemv_u32_gpu(self.weight_gpu(name), torch.as_tensor(c.view(np.int32), device="cuda")).cpu().numpy()
+            W = self.weight_gpu(name); y = gemv_u32_gpu(W, torch.as_tensor(c.view(np.int32), device=W.device)).cpu().numpy()
         else: y = gemv_u32(self.lin[name].q, c)
         self.time_online += time.perf_counter() - t
         return y
@@ -392,8 +484,9 @@ class FoldServer(Server):
             self.time_pads += time.perf_counter() - t
         if self.gpu:   # time includes host<->GPU copies of c and the reply (they arrive/leave over the network)
             import torch
-            w = torch.as_tensor(c.view(np.int32), device="cuda") - self.u[name]           # int32 wraps: mod 2^32
-            y = fold.reply_bits(gemv_u32_gpu(self.weight_gpu(name), w), self.out_bits).to(torch.int32).cpu().numpy()
+            W = self.weight_gpu(name)
+            w = torch.as_tensor(c.view(np.int32), device=W.device) - self.u[name].to(W.device)   # int32 wraps: mod 2^32
+            y = fold.reply_bits(gemv_u32_gpu(W, w), self.out_bits).to(torch.int32).cpu().numpy()
         else:
             y = fold.reply_bits(gemv_u32(self.lin[name].q, c - self.u[name].numpy().view(np.uint32)).astype(np.int64),
                                 self.out_bits)
@@ -406,14 +499,15 @@ class FoldServer(Server):
         t = time.perf_counter()
         if not set(toks) <= set(getattr(self, "pos", ())):       # first request of a pass: pads for all its tokens
             self.pos = {int(tk): i for i, tk in enumerate(toks)}
-            parts = [self.pads.batch(self.b[:, toks[i:i + 8]].transpose(1, 0, 2)) for i in range(0, len(toks), 8)]
+            step = max(1, min(8, 2400 // len(self.pads.FA)))      # tokens per FFT batch: bounded GPU memory for big models
+            parts = [self.pads.batch(self.b[:, toks[i:i + step]].transpose(1, 0, 2)) for i in range(0, len(toks), step)]
             self.U = {nm: torch.cat([p[j] for p in parts]) for j, nm in enumerate(self.order)}
             if self.gpu: torch.cuda.synchronize()
             self.time_pads += time.perf_counter() - t
         U = self.U[name][[self.pos[int(tk)] for tk in toks]]
         if self.gpu:
-            W = self.weight_gpu(name)
-            y = torch.cat([fold.reply_bits(gemm_u32_gpu(W, torch.as_tensor(C[i:i + 16].view(np.int32), device="cuda") - U[i:i + 16]),
+            W = self.weight_gpu(name); U = U.to(W.device)
+            y = torch.cat([fold.reply_bits(gemm_u32_gpu(W, torch.as_tensor(C[i:i + 16].view(np.int32), device=W.device) - U[i:i + 16]),
                                            self.out_bits).to(torch.int32) for i in range(0, len(C), 16)]).cpu().numpy()
         else:
             w = C - U.numpy().view(np.uint32)

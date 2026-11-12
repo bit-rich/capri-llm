@@ -2,18 +2,29 @@ import time, json, os, sys, numpy as np
 from protocol import *
 from prompts import PROMPTS, NEW_TOKENS, CALIB, encode, decode
 
+opt = lambda name, default=None: next((a[len(name) + 1:] for a in sys.argv if a.startswith(name + "=")), default)
 repo, tag = (("Qwen/Qwen3-8B", "_8b") if "8b" in sys.argv else ("Qwen/Qwen3-4B", "_4b") if "4b" in sys.argv
              else ("Qwen/Qwen3-1.7B", "_1.7b") if "1.7b" in sys.argv else ("Qwen/Qwen3-0.6B", ""))
+if opt("repo"): repo = opt("repo"); tag = "_" + repo.split("/")[-1].lower()      # any supported HF model, e.g. a Mistral3 one
+if not repo.startswith("Qwen/"):                           # the last prompt is Qwen chat markup: use plain text elsewhere
+    PROMPTS = PROMPTS[:3] + ["Question: Name three primary colors.\nAnswer:"]
+short = ("_p%sn%s" % (opt("prompts", len(PROMPTS)), opt("new", NEW_TOKENS))) if opt("prompts") or opt("new") else ""   # results file suffix
+PROMPTS, NEW_TOKENS = PROMPTS[:int(opt("prompts", len(PROMPTS)))], int(opt("new", NEW_TOKENS))   # fewer for big models
 small = tag == ""                                          # fp32 weights for the reference only fit for 0.6B
+gpuload = "gpuload" in sys.argv and gpu_available() and not small   # decode, merge and quantize the weights on the GPU (big models)
 w4 = "w4" in sys.argv and not small                        # 8B with GPTQ 4-bit block weights (quant4.py)
 path = qwen_path(repo)
 merge = "merge" in sys.argv                                # 2 round trips per block instead of 4 (merged weights)
 boost = None
 if merge:      # per-layer input balance of the merged layers, calibrated once on public text and cached
     cf = f"merge_calib{tag}.json"
-    if not os.path.exists(cf): json.dump(merge_boost(Qwen3(path, keep_float=False, merge=True), encode(path, CALIB)), open(cf, "w"), indent=1)
+    if not os.path.exists(cf):
+        ids = encode(path, CALIB)[:int(opt("calib", 10 ** 6))]
+        json.dump(merge_boost(Qwen3(path, keep_float=False, merge=True, dev="cuda" if gpuload else None), ids), open(cf, "w"), indent=1)
     boost = json.load(open(cf))
-t = time.perf_counter(); model = Qwen3(path, keep_float=small, w4="qwen3_8b_w4.npz" if w4 else None, merge=merge, boost=boost); t_load = time.perf_counter() - t
+t = time.perf_counter()
+model = Qwen3(path, keep_float=small, w4="qwen3_8b_w4.npz" if w4 else None, merge=merge, boost=boost, dev="cuda" if gpuload else None)
+t_load = time.perf_counter() - t
 v3 = "v3" in sys.argv                                      # c0 folded into the online reply (fold.py)
 bits = next((int(a[5:]) for a in sys.argv if a.startswith("bits=")), 16)   # v3: bits per row in the online reply
 lwe, bfv = InnerLWE(), (None if v3 else BFV32() if 'v2' in sys.argv else BFV())
@@ -22,7 +33,9 @@ prompt_ids = [encode(path, p) for p in PROMPTS]
 T = sum(len(ids) + NEW_TOKENS - 1 for ids in prompt_ids)   # forward passes = alphas needed
 
 gpu_off = (v3 or 'v2' in sys.argv) and 'cpu' not in sys.argv and gpu_available()   # offline BFV / one-time C1' on GPU
-gpu = gpu_off and tag != "_8b" or gpu_off and w4   # online GEMVs on GPU if weights fit (8B int8 7.6 GB: no; 4B int8 4 GB, 8B 4-bit 4.1 GB: yes)
+need = sum((L.packed if L.packed is not None else L.q).nbytes for _, L in model.linears())
+if gpu_off: import torch; torch.cuda.empty_cache()
+gpu = gpu_off and need <= sum(max(f, 0) for f in gpu_free())   # online GEMVs on the GPU(s) if the weights fit, else on the CPU
 t = time.perf_counter()
 server = FoldServer(model, lwe, gpu=gpu, gpu_setup=gpu_off, out_bits=bits) if v3 else Server(model, lwe, gpu=gpu)
 t_setup = time.perf_counter() - t
@@ -67,25 +80,31 @@ for k, ids in enumerate(prompt_ids):
         rel_fp += rel_err(pv_toks, pv_lg, fp_toks, fp_lg); r["private_eq_fp32"] = pv_toks == fp_toks
     if hf:
         assert hf[k]["prompt_ids"] == ids
-        r["private_eq_hf"] = pv_toks == hf[k]["tokens"]; r["w8_eq_hf"] = w8_toks == hf[k]["tokens"]
-        rel_hf += rel_err(pv_toks, pv_lg, hf[k]["tokens"], hf_logits[k])
-        if small: r["fp32_eq_hf"] = fp_toks == hf[k]["tokens"]
+        hf_toks = hf[k]["tokens"][:NEW_TOKENS]                # the reference has 24 steps; a shorter run compares its prefix
+        r["private_eq_hf"] = pv_toks == hf_toks; r["w8_eq_hf"] = w8_toks == hf_toks
+        rel_hf += rel_err(pv_toks, pv_lg, hf_toks, hf_logits[k][:NEW_TOKENS])
+        if small: r["fp32_eq_hf"] = fp_toks == hf_toks
     per_prompt.append(r); print(json.dumps(r), flush=True)
 
 # plaintext server baseline: same GEMVs with int8 activations, on the same device as the private server
 names = server.order
-if merge:      # normal inference would not merge: time the baseline on the ordinary int8 weights
-    base = Qwen3(path, keep_float=False); names = [n for n, _ in base.linears()]
+nobase = "nobase" in sys.argv                              # skip the native baseline timing (big models: saves a second load)
+if merge and not nobase:   # normal inference would not merge: time the baseline on the ordinary int8 weights
+    base = Qwen3(path, keep_float=False, dev="cuda" if gpuload else None); names = [n for n, _ in base.linears()]
     server.lin = dict(base.linears())
     if gpu: server.upload_gpu()
-if gpu:   # activations already on the GPU (no copies), synchronised once per token
+res_extra = dict(gpus=[torch.cuda.get_device_name(i) for i in range(torch.cuda.device_count())] if gpu else [], weights_GB=need / 1e9,
+                 n_prompts=len(PROMPTS), new_tokens=NEW_TOKENS, loaded_on_gpu=gpuload) if gpu_off else {}
+if nobase: t = float("nan")
+elif gpu:   # activations already on the GPU (no copies), synchronised once per token
     import torch
-    xs = {n: torch.zeros(server.lin[n].q.shape[1], dtype=torch.int8, device="cuda") for n in names}
+    xs = {n: torch.zeros(server.lin[n].q.shape[1], dtype=torch.int8, device=server.Wg[n].device) for n in names}
+    sync = lambda: [torch.cuda.synchronize(i) for i in range(torch.cuda.device_count())]
     for n in names: gemv_i8_gpu(server.weight_gpu(n), xs[n])           # warm-up; 4-bit unpacks like private
-    torch.cuda.synchronize(); t = time.perf_counter()
+    sync(); t = time.perf_counter()
     for _ in range(T):
         for n in names: gemv_i8_gpu(server.weight_gpu(n), xs[n])
-        torch.cuda.synchronize()
+        sync()
 else:
     t = time.perf_counter()
     for _ in range(T):
@@ -119,6 +138,7 @@ if small:
 if hf:
     res.update(all_private_eq_hf=all(r["private_eq_hf"] for r in per_prompt),
                logits_rel_err_vs_hf_max=float(max(rel_hf)), logits_rel_err_vs_hf_mean=float(np.mean(rel_hf)))
+res.update(res_extra)
 print(json.dumps(res, indent=1))
-json.dump(res, open(f"results_qwen{tag}" + ("_w4" if w4 else "") + ("_merge" if merge else "") + ("_v3" + (f"_b{bits}" if bits != 16 else "") + ("_cpuclient" if "cpuclient" in sys.argv else "") if v3
+json.dump(res, open(f"results_qwen{tag}" + ("_w4" if w4 else "") + ("_merge" if merge else "") + short + ("_v3" + (f"_b{bits}" if bits != 16 else "") + ("_cpuclient" if "cpuclient" in sys.argv else "") if v3
                                                                   else "_v2" if "v2" in sys.argv else "") + ".json", "w"), indent=1)

@@ -13,6 +13,8 @@ AMI=$(aws ec2 describe-images --region $R --owners amazon --filters \
   --query 'sort_by(Images,&CreationDate)[-1].ImageId' --output text)
 if [ ! -f $CONF/$KEY.pem ]; then
   aws ec2 create-key-pair --region $R --key-name $KEY --query KeyMaterial --output text > $CONF/$KEY.pem; chmod 600 $CONF/$KEY.pem
+elif ! aws ec2 describe-key-pairs --region $R --key-names $KEY >/dev/null 2>&1; then   # key pairs are per region: reuse ours
+  aws ec2 import-key-pair --region $R --key-name $KEY --public-key-material fileb://<(ssh-keygen -y -f $CONF/$KEY.pem) >/dev/null
 fi
 SGID=$(aws ec2 describe-security-groups --region $R --filters Name=group-name,Values=$SG --query 'SecurityGroups[0].GroupId' --output text 2>/dev/null || true)
 if [ -z "$SGID" ] || [ "$SGID" = None ]; then
@@ -22,6 +24,7 @@ MYIP=$(curl -fsS https://checkip.amazonaws.com | tr -d '[:space:]')
 aws ec2 authorize-security-group-ingress --region $R --group-id $SGID --protocol tcp --port 22 --cidr $MYIP/32 >/dev/null 2>&1 || true
 USERDATA=$(printf '#!/bin/bash\nshutdown -h +%d\n' $((HOURS * 60)))
 ID=$(aws ec2 run-instances --region $R --image-id $AMI --instance-type $TYPE --key-name $KEY --security-group-ids $SGID \
+  ${PI_SUBNET:+--subnet-id $PI_SUBNET} \
   --instance-initiated-shutdown-behavior terminate --user-data "$USERDATA" \
   --block-device-mappings 'DeviceName=/dev/sda1,Ebs={VolumeSize=150,VolumeType=gp3,DeleteOnTermination=true}' \
   --tag-specifications 'ResourceType=instance,Tags=[{Key=Name,Value=pi-test}]' --query 'Instances[0].InstanceId' --output text)

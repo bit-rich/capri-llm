@@ -10,6 +10,12 @@ step() { echo "[$(date -u +%H:%M:%S)] $*"; }
 step "compile kernels"; gcc -O3 -march=native -shared -fPIC kernels.c -o libk.so
 step "download $REPO"; python -c "from protocol import qwen_path; print(qwen_path('$REPO'))"
 step "prepare (calibrate, quantize, merge, C1')"; python server.py repo=$REPO bits=20 gpuload calib=24 prepare=$OUT
+if grep -q '"output_gate_type": "swish"' $(python -c "from protocol import qwen_path; print(qwen_path('$REPO'))")/config.json; then
+  step "gate check (config says output_gate_type=swish; HF uses sigmoid)"
+  python gate_check.py $OUT/weights tokens=48 | tee /data/gate.log
+  export PI_GATE=$(sort -t: -k2 -g <(sed -E 's/gate ([a-z]+) *: perplexity +([0-9.e+]+).*/\1:\2/' /data/gate.log) | head -1 | cut -d: -f1)
+  step "using gate $PI_GATE"
+fi
 step "check: serve the prepared weights, client on this machine (CPU), compare with plain W8"
 python server.py repo=$REPO bits=20 port=7001 weights=$OUT/weights > /data/server_check.log 2>&1 &
 SP=$!; until grep -q listening /data/server_check.log; do sleep 5; kill -0 $SP; done

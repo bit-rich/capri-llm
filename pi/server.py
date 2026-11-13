@@ -41,7 +41,7 @@ print(f"{repo}: loaded in {time.perf_counter() - t:.0f} s", flush=True)
 
 def bundle():
     """Public data the client needs besides the weight matrices: config, norm weights, per-row scales, embedding table."""
-    hdr = dict(op="bundle", repo=repo, weights_id=model.weights_id, d=model.d, L=model.L, vocab=model.vocab, hq=model.hq, hkv=model.hkv, hd=model.hd,
+    hdr = dict(op="bundle", repo=repo, weights_id=model.weights_id, attn_gate=model.attn_gate, lin_dims=model.lin_dims, d=model.d, L=model.L, vocab=model.vocab, hq=model.hq, hkv=model.hkv, hd=model.hd,
                eps=model.eps, rope_scale=model.rope_scale, out_bits=bits, lwe_seed=lwe.seed, a_pub_seed=2,
                linears=[[n, *L.q.shape, float(L.row_norm_max)] for n, L in model.linears()],
                blocks=[{k: (v if np.isscalar(v) else None) for k, v in b.items() if not isinstance(v, Linear)} for b in model.blocks])

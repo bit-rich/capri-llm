@@ -185,9 +185,11 @@ class Linear:
 
 def rmsnorm(x, w, eps): return x / np.sqrt((x * x).mean(-1, keepdims=True) + eps) * w
 def silu(x): return x / (1 + np.exp(-x))
-def rope(x, cos, sin):                           # x (heads, hd), HF rotate_half convention
-    h = x.shape[-1] // 2
-    return x * cos + np.concatenate([-x[..., h:], x[..., :h]], -1) * sin
+def sigmoid(x): return 1 / (1 + np.exp(-x))
+def rope(x, cos, sin):                           # x (..., heads, hd), HF rotate_half convention, on the first cos.shape[-1] dims
+    rd = cos.shape[-1]; h = rd // 2; xr = x[..., :rd]
+    out = xr * cos + np.concatenate([-xr[..., h:], xr[..., :h]], -1) * sin
+    return out if rd == x.shape[-1] else np.concatenate([out, x[..., rd:]], -1)
 
 def merged_linear(R, G, w, keep_float, boost=1.0):
     """One round trip for 'residual branch R, add, RMSNorm (weight w), next matrix G':
@@ -225,8 +227,11 @@ def merge_boost(m, ids):
     return {k: max(1.0, float(np.median(v))) for k, v in seen.items()}
 
 class Qwen3:
-    """Decoder-only LM in HF safetensors layout with RMSNorm, SwiGLU, RoPE and GQA: Qwen3 (per-head q/k RMSNorm), and
-    Mistral3 text models (no q/k norm, YaRN RoPE, FP8 weights, tensors under model.language_model.)."""
+    """Decoder-only LM in HF safetensors layout with RMSNorm, SwiGLU, RoPE and GQA: Qwen3 (per-head q/k RMSNorm),
+    Mistral3 text models (no q/k norm, YaRN RoPE, FP8 weights, tensors under model.language_model.), and the hybrid
+    Qwen3.5/3.6/3.8 dense models (3 of 4 blocks are gated-DeltaNet linear attention, the rest gated full attention
+    with partial RoPE; zero-centred RMSNorm weights). Every block is still 'input projection -> client-side token mixer
+    -> output projection -> MLP', so the server side and the 2-trips-per-block merge are unchanged."""
     def __init__(self, path=None, keep_float=True, w4=None, merge=False, boost=None, dev=None):
         """dev (e.g. "cuda"): decode, merge and quantize the weights on that GPU instead of in numpy (needs keep_float=False).
         Same arithmetic; meant for big models, where the numpy path takes hours."""
@@ -240,46 +245,65 @@ class Qwen3:
         self.hd = cfg.get("head_dim") or self.d // self.hq
         self.eps, rp = cfg["rms_norm_eps"], cfg.get("rope_parameters") or dict(rope_theta=cfg.get("rope_theta"))
         assert not rp.get("llama_4_scaling_beta") and not cfg.get("sliding_window"), "not implemented"
-        if rp.get("rope_type", "default") == "yarn": self.inv_freq, self.rope_scale = yarn_rope(rp, self.hd, cfg["max_position_embeddings"])
-        else: self.inv_freq, self.rope_scale = rp["rope_theta"] ** (-np.arange(0, self.hd, 2) / self.hd), 1.0
+        rd = int(self.hd * rp.get("partial_rotary_factor", cfg.get("partial_rotary_factor", 1.0)))   # rotary dims per head
+        if rp.get("rope_type", "default") == "yarn": self.inv_freq, self.rope_scale = yarn_rope(rp, rd, cfg["max_position_embeddings"])
+        else: self.inv_freq, self.rope_scale = rp["rope_theta"] ** (-np.arange(0, rd, 2) / rd), 1.0
+        lt = cfg.get("layer_types") or ["full_attention"] * self.L
+        is_lin = [t == "linear_attention" for t in lt]
+        self.attn_gate = bool(cfg.get("attn_output_gate"))        # q_proj also emits a per-head output gate
+        self.lin_dims = ([cfg["linear_num_key_heads"], cfg["linear_num_value_heads"], cfg["linear_key_head_dim"],
+                          cfg["linear_value_head_dim"], cfg["linear_conv_kernel_dim"]] if any(is_lin) else None)
+        zc = cfg.get("model_type", "").startswith("qwen3_5")       # zero-centred RMSNorm: the scale is 1 + weight
         f64 = lambda k: W[k].astype(np.float64)
+        nrm = lambda k: f64(k) + 1.0 if zc else f64(k)
         def cat(*ks):                            # block weights: numpy float32, or torch float32 on dev
             ws = [W.get(k, dev) for k in ks]
             return ws[0] if len(ws) == 1 else np.concatenate(ws) if dev is None else __import__("torch").cat(ws)
-        vec = lambda k: W.get(k, dev)            # norm weight in the same form
+        vec = lambda k: W.get(k, dev) + 1.0 if zc else W.get(k, dev)   # norm weight in the same form
         lin = lambda *ks: Linear(cat(*ks), keep_float)
+        def inkeys(i):                           # the block's input projection (one matrix for the server)
+            p = f"{M}layers.{i}."
+            if is_lin[i]: return [p + "linear_attn." + s for s in ("in_proj_qkv.weight", "in_proj_z.weight", "in_proj_b.weight", "in_proj_a.weight")]
+            return [p + "self_attn." + s for s in ("q_proj.weight", "k_proj.weight", "v_proj.weight")]
+        outkey = lambda i: f"{M}layers.{i}." + ("linear_attn.out_proj.weight" if is_lin[i] else "self_attn.o_proj.weight")
+        def extras(i):                           # small public weights of the client-side token mixer
+            p = f"{M}layers.{i}."
+            if is_lin[i]:
+                a = p + "linear_attn."
+                return dict(linear=1.0, conv=f64(a + "conv1d.weight").reshape(-1, self.lin_dims[4]), dt_bias=f64(a + "dt_bias"),
+                            A_log=f64(a + "A_log"), gnorm=f64(a + "norm.weight"))
+            a = p + "self_attn."
+            return dict(q_norm=nrm(a + "q_norm.weight"), k_norm=nrm(a + "k_norm.weight")) if a + "q_norm.weight" in W else {}
         if w4 is not None:
             lin4 = lambda key: Linear.from_int(unpack4(w4[key + ".packed"]), w4[key + ".scale"], w4[key + ".packed"])
         self.embed = W.raw(M + "embed_tokens.weight")          # public table (bf16 memmap); client looks up its row
         self.blocks = []; self.merged = merge
-        qk = lambda a: dict(q_norm=f64(a + "q_norm.weight"), k_norm=f64(a + "k_norm.weight")) if a + "q_norm.weight" in W else {}
         for i in range(self.L if merge else 0):  # 2 round trips per block: o+gate_up ("ob") and down+next qkv ("da")
             assert w4 is None, "merge needs the float weights"
-            p = f"{M}layers.{i}."; a, m = p + "self_attn.", p + "mlp."; nx = f"{M}layers.{i + 1}."
-            b = dict(qkv=lin(a + "q_proj.weight", a + "k_proj.weight", a + "v_proj.weight")) if i == 0 else {}
+            p = f"{M}layers.{i}."; m = p + "mlp."; nx = f"{M}layers.{i + 1}."
+            b = dict(qkv=lin(*inkeys(0))) if i == 0 else {}
             bo = lambda k: (boost or {}).get(f"{i}.{k}", 1.0)
-            b["ob"], b["lam_ob"] = merged_linear(cat(a + "o_proj.weight"), cat(m + "gate_proj.weight", m + "up_proj.weight"),
+            b["ob"], b["lam_ob"] = merged_linear(cat(outkey(i)), cat(m + "gate_proj.weight", m + "up_proj.weight"),
                                                  vec(p + "post_attention_layernorm.weight"), keep_float, bo("ob"))
-            b["w_ob"] = f64(p + "post_attention_layernorm.weight")
+            b["w_ob"] = nrm(p + "post_attention_layernorm.weight")
             if i < self.L - 1:
                 b["da"], b["lam_da"] = merged_linear(
-                    cat(m + "down_proj.weight"), cat(nx + "self_attn.q_proj.weight", nx + "self_attn.k_proj.weight",
-                                                     nx + "self_attn.v_proj.weight"), vec(nx + "input_layernorm.weight"), keep_float, bo("da"))
-                b["w_da"] = f64(nx + "input_layernorm.weight")
+                    cat(m + "down_proj.weight"), cat(*inkeys(i + 1)), vec(nx + "input_layernorm.weight"), keep_float, bo("da"))
+                b["w_da"] = nrm(nx + "input_layernorm.weight")
             else: b["down"] = lin(m + "down_proj.weight")
-            b.update(ln1=f64(p + "input_layernorm.weight"), **qk(a))
+            b.update(ln1=nrm(p + "input_layernorm.weight"), **extras(i))
             self.blocks.append(b)
         for i in range(0 if merge else self.L):
-            p = f"{M}layers.{i}."; a, m = p + "self_attn.", p + "mlp."
+            p = f"{M}layers.{i}."; m = p + "mlp."
             self.blocks.append(dict(
-                qkv=lin(a + "q_proj.weight", a + "k_proj.weight", a + "v_proj.weight"),
-                o=lin(a + "o_proj.weight"),
+                qkv=lin(*inkeys(i)),
+                o=lin(outkey(i)),
                 gate_up=lin(m + "gate_proj.weight", m + "up_proj.weight"),
                 down=lin(m + "down_proj.weight"),
             ) if w4 is None else {k: lin4(f"{i}.{k}") for k in ("qkv", "o", "gate_up", "down")})
             self.blocks[-1].update(
-                ln1=f64(p + "input_layernorm.weight"), ln2=f64(p + "post_attention_layernorm.weight"), **qk(a))
-        self.norm = f64(M + "norm.weight")
+                ln1=nrm(p + "input_layernorm.weight"), ln2=nrm(p + "post_attention_layernorm.weight"), **extras(i))
+        self.norm = nrm(M + "norm.weight")
         self.head = lin("lm_head.weight" if "lm_head.weight" in W else M + "embed_tokens.weight")
     def linears(self):
         out = []
@@ -295,21 +319,63 @@ def attend(q, K, V):
     s = np.exp(s - s.max(-1, keepdims=True)); s /= s.sum(-1, keepdims=True)
     return np.einsum("grt,tgd->grd", s, V).reshape(hq * hd)
 
+def delta_mix(m, b, rows, layer_cache, t0):
+    """Gated DeltaNet linear attention (Qwen3.5 family), client side, token by token. rows (T, R) = the block's input
+    projection [q k v | z | b | a]. State: the last (kernel - 1) conv inputs and the recurrent matrix S per value head.
+    layer_cache = (states, placeholders): states[t] is the state after token t; older ones are dropped except what a
+    rollback within the current pass (speculative decoding) can need."""
+    nk, nv, dk, dv, ks = m.lin_dims; cd = 2 * nk * dk + nv * dv; rep_ = nv // nk
+    hist, ph = layer_cache
+    win, S = hist[-1] if hist else (np.zeros((ks - 1, cd)), np.zeros((nv, dk, dv)))
+    out = []
+    for r in rows:
+        xq, z, bb, aa = np.split(r, [cd, cd + nv * dv, cd + nv * dv + nv])
+        full = np.vstack([win, xq[None]]); win = full[1:]           # causal depthwise conv over the last ks inputs
+        y = silu((full * b["conv"].T).sum(0))
+        q, k, v = np.split(y, [nk * dk, 2 * nk * dk])
+        q, k, v = np.repeat(q.reshape(nk, dk), rep_, 0), np.repeat(k.reshape(nk, dk), rep_, 0), v.reshape(nv, dv)
+        q = q / np.sqrt((q * q).sum(-1, keepdims=True) + 1e-6) / np.sqrt(dk)
+        k = k / np.sqrt((k * k).sum(-1, keepdims=True) + 1e-6)
+        beta, g = sigmoid(bb), -np.exp(b["A_log"]) * np.logaddexp(0, aa + b["dt_bias"])
+        S = S * np.exp(g)[:, None, None]
+        S = S + k[:, :, None] * ((v - np.einsum("hkv,hk->hv", S, k)) * beta[:, None])[:, None, :]
+        o = np.einsum("hkv,hk->hv", S, q)
+        o = o / np.sqrt((o * o).mean(-1, keepdims=True) + m.eps) * b["gnorm"] * silu(z.reshape(nv, dv))
+        out.append(o.reshape(-1)); hist.append((win, S)); ph.append(None)
+    for j in range(max(0, t0 - 1)):
+        if hist[j] is None: continue
+        hist[j] = None
+    return np.array(out)
+
+def mix(m, b, i, rows, cache, t0, cos, sin):
+    """Client-side token mixer of block i for the T tokens of a pass: rows (T, R) = output of the block's input
+    projection, cos/sin (T, 1, rotary dims). Full attention with a KV cache (optionally output-gated), or gated DeltaNet.
+    Returns (T, A), the input of the block's output projection."""
+    if "linear" in b: return delta_mix(m, b, rows, cache[i], t0)
+    T = len(rows); nq, nk = m.hq * m.hd * (2 if m.attn_gate else 1), m.hkv * m.hd
+    qkn = lambda x, k: rmsnorm(x, b[k], m.eps) if k in b else x       # Qwen3 normalises q and k per head
+    q, k, v = np.split(rows, [nq, nq + nk], axis=1)
+    if m.attn_gate: q = q.reshape(T, m.hq, 2 * m.hd); gate = q[..., m.hd:].reshape(T, -1); q = q[..., :m.hd]
+    q = rope(qkn(q.reshape(T, m.hq, m.hd), "q_norm"), cos, sin)
+    k = rope(qkn(k.reshape(T, m.hkv, m.hd), "k_norm"), cos, sin)
+    cache[i][0].extend(k); cache[i][1].extend(v.reshape(T, m.hkv, m.hd))
+    K, V = np.array(cache[i][0]), np.array(cache[i][1])
+    a = np.stack([attend(q[j], K[:t0 + j + 1], V[:t0 + j + 1]) for j in range(T)])
+    if not m.attn_gate: return a
+    return a * (silu(gate) if os.environ.get("PI_GATE") == "swish" else sigmoid(gate))   # HF: sigmoid (see gate_check.py)
+
+def _angles(m, t0, T):
+    ang = (t0 + np.arange(T))[:, None] * np.concatenate([m.inv_freq] * 2)[None]
+    return np.cos(ang)[:, None] * m.rope_scale, np.sin(ang)[:, None] * m.rope_scale      # (T, 1, rotary dims)
+
 def forward_token(m, tok, cache, lin):
     """One decode step. `lin(name, layer, x)` performs the linear layer (plain or private)."""
-    pos = len(cache[0][0])
-    ang = np.concatenate([pos * m.inv_freq] * 2); cos, sin = np.cos(ang) * m.rope_scale, np.sin(ang) * m.rope_scale
-    qkn = lambda x, b, k: rmsnorm(x, b[k], m.eps) if k in b else x          # Qwen3 normalises q and k per head
+    pos = len(cache[0][0]); cos, sin = _angles(m, pos, 1)
     x = bf16_to_f32(m.embed[tok]).astype(np.float64)
-    nq, nk = m.hq * m.hd, m.hkv * m.hd
     rms = lambda x: np.sqrt((x * x).mean() + m.eps)
     for i, b in enumerate(m.blocks if m.merged else []):
         if i == 0: qkv = lin("0.qkv", b["qkv"], rmsnorm(x, b["ln1"], m.eps))
-        q, k, v = np.split(qkv, [nq, nq + nk])
-        q = rope(qkn(q.reshape(m.hq, m.hd), b, "q_norm"), cos, sin)
-        k = rope(qkn(k.reshape(m.hkv, m.hd), b, "k_norm"), cos, sin)
-        cache[i][0].append(k); cache[i][1].append(v.reshape(m.hkv, m.hd))
-        a = attend(q, np.array(cache[i][0]), np.array(cache[i][1]))
+        a = mix(m, b, i, qkv[None], cache, pos, cos, sin)[0]
         out = lin(f"{i}.ob", b["ob"], np.concatenate([b["lam_ob"] * a, b["w_ob"] * x]))              # o, add, norm, gate_up
         x = x + out[:m.d]; g, u = np.split(out[m.d:] / rms(x), 2)
         if "da" in b:
@@ -318,11 +384,7 @@ def forward_token(m, tok, cache, lin):
         else: x = x + lin(f"{i}.down", b["down"], silu(g) * u)
     for i, b in enumerate([] if m.merged else m.blocks):
         qkv = lin(f"{i}.qkv", b["qkv"], rmsnorm(x, b["ln1"], m.eps))
-        q, k, v = np.split(qkv, [nq, nq + nk])
-        q = rope(qkn(q.reshape(m.hq, m.hd), b, "q_norm"), cos, sin)
-        k = rope(qkn(k.reshape(m.hkv, m.hd), b, "k_norm"), cos, sin)
-        cache[i][0].append(k); cache[i][1].append(v.reshape(m.hkv, m.hd))
-        a = attend(q, np.array(cache[i][0]), np.array(cache[i][1]))
+        a = mix(m, b, i, qkv[None], cache, pos, cos, sin)[0]
         x = x + lin(f"{i}.o", b["o"], a)
         g, u = np.split(lin(f"{i}.gate_up", b["gate_up"], rmsnorm(x, b["ln2"], m.eps)), 2)
         x = x + lin(f"{i}.down", b["down"], silu(g) * u)
@@ -334,21 +396,12 @@ def forward_batch(m, toks, cache, lin, n_head=None):
     (T, d_out). Token j attends to the cache and to tokens <= j of this pass. Returns the logits of the last n_head
     tokens (default all). Used for sending a whole prompt at once and for checking several guessed tokens at once."""
     assert m.merged
-    T, t0 = len(toks), len(cache[0][0])
-    ang = (t0 + np.arange(T))[:, None] * np.concatenate([m.inv_freq] * 2)[None]
-    cos, sin = np.cos(ang)[:, None] * m.rope_scale, np.sin(ang)[:, None] * m.rope_scale    # (T, 1, hd)
-    qkn = lambda x, b, k: rmsnorm(x, b[k], m.eps) if k in b else x
+    T, t0 = len(toks), len(cache[0][0]); cos, sin = _angles(m, t0, T)
     x = np.stack([bf16_to_f32(m.embed[t]) for t in toks]).astype(np.float64)
-    nq, nk = m.hq * m.hd, m.hkv * m.hd
     rms = lambda x: np.sqrt((x * x).mean(-1, keepdims=True) + m.eps)
     for i, b in enumerate(m.blocks):
         if i == 0: qkv = lin("0.qkv", b["qkv"], rmsnorm(x, b["ln1"], m.eps))
-        q, k, v = np.split(qkv, [nq, nq + nk], axis=1)
-        q = rope(qkn(q.reshape(T, m.hq, m.hd), b, "q_norm"), cos, sin)
-        k = rope(qkn(k.reshape(T, m.hkv, m.hd), b, "k_norm"), cos, sin)
-        cache[i][0].extend(k); cache[i][1].extend(v.reshape(T, m.hkv, m.hd))
-        K, V = np.array(cache[i][0]), np.array(cache[i][1])
-        a = np.stack([attend(q[j], K[:t0 + j + 1], V[:t0 + j + 1]) for j in range(T)])
+        a = mix(m, b, i, qkv, cache, t0, cos, sin)
         out = lin(f"{i}.ob", b["ob"], np.concatenate([b["lam_ob"] * a, b["w_ob"] * x], 1))
         x = x + out[:, :m.d]; g, u = np.split(out[:, m.d:] / rms(x), 2, axis=1)
         if "da" in b:
@@ -598,7 +651,8 @@ def save_prepared(m, out, tokenizer_json):
         v = a.reshape(-1).view(np.uint8)
         for i in range(0, len(v), 1 << 30): h.update(v[i:i + (1 << 30)])
     meta = dict(d=m.d, L=m.L, vocab=m.vocab, hq=m.hq, hkv=m.hkv, hd=m.hd, eps=m.eps, rope_scale=float(m.rope_scale),
-                merged=m.merged, linears=[], blocks=[])
+                merged=m.merged, attn_gate=bool(getattr(m, "attn_gate", False)), lin_dims=getattr(m, "lin_dims", None),
+                linears=[], blocks=[])
     put("inv_freq", np.asarray(m.inv_freq, np.float64)); put("norm", np.asarray(m.norm, np.float64)); put("embed", np.asarray(m.embed))
     for n, L in m.linears():
         put(n + ".q", L.q); put(n + ".scale", np.asarray(L.scale, np.float32))
@@ -621,6 +675,7 @@ def load_prepared(d):
     get = lambda name: np.load(os.path.join(d, name + ".npy"), allow_pickle=False)
     m = Qwen3.__new__(Qwen3)
     for k in ("d", "L", "vocab", "hq", "hkv", "hd", "eps", "rope_scale", "merged"): setattr(m, k, meta[k])
+    m.attn_gate, m.lin_dims = meta.get("attn_gate", False), meta.get("lin_dims")
     m.inv_freq, m.norm, m.embed, m.weights_id = get("inv_freq"), get("norm"), get("embed"), meta["weights_id"]
     lin = {}
     for n, r, k, rn in meta["linears"]:

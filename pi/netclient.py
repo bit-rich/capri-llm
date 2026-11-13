@@ -53,7 +53,8 @@ def client_model(h, arrays):
     """The client's half of the model, from the public bundle."""
     inv_freq, norm, embed, tok_json = arrays[:4]; i = 4
     m = types.SimpleNamespace(d=h["d"], L=h["L"], vocab=h["vocab"], hq=h["hq"], hkv=h["hkv"], hd=h["hd"], eps=h["eps"],
-                              rope_scale=h["rope_scale"], inv_freq=inv_freq, norm=norm, embed=embed, merged=True)
+                              rope_scale=h["rope_scale"], inv_freq=inv_freq, norm=norm, embed=embed, merged=True,
+                              attn_gate=h.get("attn_gate", False), lin_dims=h.get("lin_dims"))
     lin = {}
     for n, r, k, rn in h["linears"]:
         lin[n] = types.SimpleNamespace(scale=arrays[i], row_norm_max=rn); i += 1

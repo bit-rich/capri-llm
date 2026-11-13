@@ -1,0 +1,66 @@
+{
+ "model": "Qwen/Qwen3.5-0.8B (merged, 2 trips per block)",
+ "server_on_gpu": true,
+ "offline_on_gpu": true,
+ "tokens_forwarded": 136,
+ "prompts": [
+  {
+   "prompt": "The capital of France is",
+   "private_text": " Paris.\nThe capital of France is Paris.\nThe capital of France is Paris.\nThe capital of France is",
+   "private_eq_w8": true,
+   "min_w8_top2_margin": 0.19785308837890625
+  },
+  {
+   "prompt": "def fibonacci(n):\n    \"\"\"Return the n-th Fibonacci number.\"\"\"\n",
+   "private_text": "    if n < 0:\n        raise ValueError(\"n must be non-negative\")\n    if n == ",
+   "private_eq_w8": true,
+   "min_w8_top2_margin": 0.12105560302734375
+  },
+  {
+   "prompt": "Photosynthesis is the process by which",
+   "private_text": " plants convert light energy into chemical energy. This process involves the absorption of light energy by chlorophyll, which is a",
+   "private_eq_w8": true,
+   "min_w8_top2_margin": 0.030376434326171875
+  },
+  {
+   "prompt": "<|im_start|>user\nName three primary colors.<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+   "private_text": "The three primary colors of light are **Red**, **Green**, and **Blue**.\n\nThese are the colors that are",
+   "private_eq_w8": true,
+   "min_w8_top2_margin": 0.011737823486328125
+  }
+ ],
+ "all_private_eq_w8": true,
+ "logits_rel_err_vs_w8_max": 0.0027712611496196627,
+ "logits_rel_err_vs_w8_mean": 0.0015758157074659482,
+ "server_online_s_per_tok": 0.02112456625790775,
+ "server_plain_int8_s_per_tok": 0.005219415191170222,
+ "online_overhead": 4.047305202629705,
+ "client_mask_s_per_tok": 0.012019914839236341,
+ "client_unmask_s_per_tok": 0.005177972868509909,
+ "private_total_s_per_tok_excl_network": 0.05686768590433477,
+ "rounds_per_tok": 50.0,
+ "online_up_KB_per_tok": 741.376,
+ "online_down_KB_per_tok": 1620.64,
+ "offline_server_s_per_tok_amortized": 4.5434500606233996e-10,
+ "offline_client_s_per_tok_amortized": 0.000990806667235944,
+ "offline_up_KB_per_tok": 10.24,
+ "offline_down_KB_per_tok": 0.0,
+ "offline_server_s_batch": 1.8609971448313445e-06,
+ "offline_client_s_batch": 4.058344108998426,
+ "hint_setup_s": 0.05032549099996686,
+ "D_total": 648256,
+ "params": 1764671488,
+ "reply_bits": 20,
+ "client_offline_on_gpu": true,
+ "server_pads_s_per_tok": 0.0009009691619158891,
+ "offline_up_MB_batch": 41.94304,
+ "public_c1_server_s_once": 13.245894410014444,
+ "public_c1_download_GB_once": 10.621026304,
+ "gpus": [
+  "NVIDIA RTX 2000 Ada Generation Laptop GPU"
+ ],
+ "weights_GB": 1.764671488,
+ "n_prompts": 4,
+ "new_tokens": 24,
+ "loaded_on_gpu": false
+}

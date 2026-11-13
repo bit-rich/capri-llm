@@ -22,7 +22,7 @@ NEW, cache_dir = int(opt("new", NEW_TOKENS)), opt("cache")
 from netclient import LWE_SEED, A_PUB_SEED
 
 
-from netclient import RemoteServer, client_model, connect
+from netclient import RemoteServer, client_model, connect, make_client
 import netclient
 
 
@@ -52,8 +52,7 @@ if K:
     draft = Draft()
 
 # ---------------------------------------------------------------- offline: one batch for this run
-lwe = InnerLWE(LWE_SEED); remote = RemoteServer(c, bh, lwe)
-client = FoldClient(remote, lwe, None, gpu=torch.cuda.is_available())
+client, remote, run = make_client(c, bh, model)
 n_secrets = sum(len(i) for i in ids_all) + len(ids_all) * (NEW - 1) * (K + 1) + 8
 up0, dn0, t = c.sent, c.recvd, time.perf_counter()
 off = client.offline(n_secrets)
@@ -65,14 +64,14 @@ results = []
 for p, ids in zip(prompts, ids_all):
     cache = [([], []) for _ in model.blocks]
     u0, d0, r0, s0, t0 = c.sent, c.recvd, client.rounds, remote.server_s, time.perf_counter()
-    client.begin_pass(len(ids)); lg = forward_batch(model, ids, cache, client.lin_batch, n_head=1)
+    client.begin_pass(len(ids)); lg = run(ids, cache, n_head=1)
     gen = [int(lg[-1].argmax())]; t_first = time.perf_counter() - t0
     if draft: draft.reset()
     while len(gen) < NEW:
         k = min(K, NEW - len(gen) - 1); seq = ids + gen
         d = draft.propose(seq, k) if k else []
         client.begin_pass(k + 1); n0 = len(cache[0][0])
-        lg = forward_batch(model, [gen[-1]] + d, cache, client.lin_batch); pr = lg.argmax(1)
+        lg = run([gen[-1]] + d, cache); pr = lg.argmax(1)
         a = next((i for i in range(k) if d[i] != pr[i]), k)
         gen += d[:a] + [int(pr[a])]; cache_keep(cache, n0 + a + 1)
         if draft: draft.keep(len(seq) + a)

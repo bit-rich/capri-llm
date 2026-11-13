@@ -131,6 +131,7 @@ class ChainClient:
         self.z = {}
         rows = lambda name: self.srv.lin[name.split("@")[0]].q.shape[0]
         for kind, name, r0, C1 in self.srv.public_c1():
+            C1 = C1.to(self.dev)                                          # arrives in host memory over a network
             z = self.key.unmask_full(C1, n_tokens) if kind == "full" else self.key.unmask_top(C1, n_tokens)
             if name not in self.z: self.z[name] = np.empty((n_tokens, rows(name)), dtype=np.int64)
             self.z[name][:, r0:r0 + len(C1)] = z.T.cpu().numpy()          # (tokens, rows)

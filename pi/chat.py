@@ -10,7 +10,7 @@ about 4 bytes x weight rows per token (19 MB per token for Qwen3-32B). When the 
 the next batch and carries on with the same conversation.
 k=N: guess N tokens ahead with a local Qwen3-0.6B (helps on fast links; on a slow upload it sends more data)."""
 import sys, time, numpy as np, torch
-from netclient import RemoteServer, connect, cached_bundle, client_model, LWE_SEED
+from netclient import RemoteServer, connect, cached_bundle, client_model, make_client, LWE_SEED
 import netclient
 from protocol import InnerLWE, FoldClient, forward_batch, cache_keep
 
@@ -27,8 +27,7 @@ else:
     c, s, bh, model, tok, rtt = connect(HOST, PORT, CACHE)
 if not bh["repo"].startswith("Qwen/"): raise SystemExit("chat formatting is written for Qwen chat models")
 END = tok.token_to_id("<|im_end|>")
-lwe = InnerLWE(LWE_SEED); remote = RemoteServer(None if early else c, bh, lwe)
-client = FoldClient(remote, lwe, None, gpu=torch.cuda.is_available())
+client, remote, run = make_client(None if early else c, bh, model)
 left = 0
 held = []
 if early: remote.receive_b = held.append    # keep the per-batch upload until the server is there
@@ -82,7 +81,7 @@ while True:
     text = ("\n" if pending else "") + f"<|im_start|>user\n{msg}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
     ids = pending + tok.encode(text).ids
     u0, d0, r0, t0 = c.sent, c.recvd, client.rounds, time.perf_counter()
-    take(len(ids)); lg = forward_batch(model, ids, cache, client.lin_batch, n_head=1)
+    take(len(ids)); lg = run(ids, cache, n_head=1)
     history += ids; gen = [int(lg[-1].argmax())]; t_first = time.perf_counter() - t0
     print("model> ", end="", flush=True); shown = ""
     def show():
@@ -93,7 +92,7 @@ while True:
         k = min(K, MAX_NEW - len(gen) - 1)
         d = draft_propose(history + gen, k) if k else []
         take(k + 1); n0 = len(cache[0][0])
-        lg = forward_batch(model, [gen[-1]] + d, cache, client.lin_batch); p = lg.argmax(1)
+        lg = run([gen[-1]] + d, cache); p = lg.argmax(1)
         a = next((i for i in range(k) if d[i] != p[i]), k)
         gen += d[:a] + [int(p[a])]; cache_keep(cache, n0 + a + 1)
         if END in gen: gen = gen[:gen.index(END) + 1]

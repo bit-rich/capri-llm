@@ -2,7 +2,7 @@
 See client.py for the security notes: secrets stay here, public randomness comes from the client's own seeds."""
 import json, os, socket, time, types, numpy as np, torch
 import fold
-from net import Conn, unpack_bits, client_auth, token_from_env
+from net import Conn, pack_bits, unpack_bits, client_auth, token_from_env
 from protocol import InnerLWE, FoldClient
 
 LWE_SEED, A_PUB_SEED = 0, 2                    # the client's own: never taken from the server
@@ -49,11 +49,66 @@ class RemoteServer:
         return unpack_bits(a[0], self.out_bits, int(np.prod(h["shape"]))).reshape(h["shape"])
 
 
+class RemoteChainServer:
+    """What chainproto.ChainClient needs from a v4 server, over the connection. All public randomness (inner a's and
+    the BFV a_j) is regenerated locally from the client's own seeds, never taken from the server."""
+    def __init__(self, conn, bh, model):
+        import chainproto as CP, fold56 as F
+        v = bh["v4"]
+        assert (v["n"], v["inner_seed"], v["a_pub_seed"]) == (CP.N_LWE, 21, 3), "server uses different public randomness"
+        self.c, self.model, self.CP = conn, model, CP
+        self.p = F.P(n=v["n"], N=v["N"]); self.a_pub = F.public_a(self.p, seed=3)
+        self.order = [n for n, *_ in bh["linears"]]
+        shapes = {n: (r, k) for n, r, k, _ in bh["linears"]}
+        self.lin = {n: types.SimpleNamespace(q=np.broadcast_to(np.int8(0), shapes[n])) for n in self.order}
+        scales = {n: s for n, s in zip(self.order, model._scales)}
+        self.pub = {n: dict(rn=rn, spec=sp, scale=scales[n]) for n, (rn, sp) in v["pub"].items()}
+        self.W = {r: dict(K=K, Wmax=Wm, W=w) for (r, (K, Wm)), w in zip(((r, v["W"][r]) for r in v["W_order"]), model._W)}
+        self.server_s = self.time_c1 = 0.0; self.cache = None
+
+    def public_c1(self):
+        t = time.perf_counter(); self.c.send(dict(op="c1"))
+        while True:
+            h, a = self.c.recv()
+            if h["op"] == "c1done": break
+            self.time_c1 += time.perf_counter() - t
+            yield h["kind"], h["name"], h["r0"], torch.from_numpy(a[0].astype(np.int64))
+            t = time.perf_counter()
+
+    def receive_b(self, b):
+        self.c.send(dict(op="b"), [b]); assert self.c.recv()[0]["op"] == "ok"
+
+    def single(self, name, toks, C):
+        self.c.send(dict(op="single", name=name, toks=[int(t) for t in toks], shape=list(C.shape)), [pack_bits(C, 56)])
+        h, a = self.c.recv(); self.server_s += h["server_s"]
+        return unpack_bits(a[0], self.CP.RB, int(np.prod(h["shape"]))).reshape(h["shape"])
+
+    def pair(self, r, g, toks, Cv, Cx):
+        self.c.send(dict(op="pair", r=r, g=g, toks=[int(t) for t in toks], shape_v=list(Cv.shape), shape_x=list(Cx.shape)),
+                    [pack_bits(Cv, 56), pack_bits(Cx, 56)])
+        h, a = self.c.recv(); self.server_s += h["server_s"]
+        return (unpack_bits(a[0], 56, int(np.prod(h["shape_t"]))).reshape(h["shape_t"]),
+                unpack_bits(a[1], self.CP.RB, int(np.prod(h["shape_y"]))).reshape(h["shape_y"]))
+
+
+def make_client(c, bh, model, lwe_seed=LWE_SEED):
+    """(client, remote, run) for the server's mode; run(ids, cache, n_head=None) does one private pass."""
+    if bh.get("mode") == "v4":
+        import chainproto as CP
+        remote = RemoteChainServer(c, bh, model)
+        cl = CP.ChainClient(remote, dev="cuda" if torch.cuda.is_available() else "cpu")
+        return cl, remote, lambda ids, cache, n_head=None: cl.forward(ids, cache, n_head)
+    from protocol import forward_batch
+    lwe = InnerLWE(lwe_seed); remote = RemoteServer(c, bh, lwe)
+    cl = FoldClient(remote, lwe, None, gpu=torch.cuda.is_available())
+    return cl, remote, lambda ids, cache, n_head=None: forward_batch(model, ids, cache, cl.lin_batch, n_head)
+
+
 def client_model(h, arrays):
     """The client's half of the model, from the public bundle."""
     inv_freq, norm, embed, tok_json = arrays[:4]; i = 4
     m = types.SimpleNamespace(d=h["d"], L=h["L"], vocab=h["vocab"], hq=h["hq"], hkv=h["hkv"], hd=h["hd"], eps=h["eps"],
-                              rope_scale=h["rope_scale"], inv_freq=inv_freq, norm=norm, embed=embed, merged=True,
+                              rope_scale=h["rope_scale"], inv_freq=inv_freq, norm=norm, embed=embed, merged=h.get("mode") != "v4",
                               attn_gate=h.get("attn_gate", False), lin_dims=h.get("lin_dims"))
     lin = {}
     for n, r, k, rn in h["linears"]:
@@ -65,6 +120,8 @@ def client_model(h, arrays):
         for k in ("qkv", "ob", "da", "down"):
             if f"{j}.{k}" in lin: blk[k] = lin[f"{j}.{k}"]
         m.blocks.append(blk)
+    m._scales = [lin[n].scale for n, *_ in h["linears"]]
+    m._W = arrays[i:i + len(h["v4"]["W_order"])] if h.get("mode") == "v4" else []      # v4: integer chain multipliers
     from tokenizers import Tokenizer
     return m, Tokenizer.from_str(bytes(tok_json).decode())
 

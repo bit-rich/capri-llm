@@ -1,4 +1,4 @@
-"""Private inference server (v3 + merge) over TCP. It holds the public weights and sees only masked data.
+"""Private inference server (v3 + merge, or v4 chain with `v4`) over TCP. It holds the public weights and sees only masked data.
 
   python server.py [repo=<HF id> | 1.7b | 4b] [bits=20] [gpuload] [weights=DIR] [prepare=DIR] [port=7000] [host=127.0.0.1]  (host=0.0.0.0 to accept remote clients; there is no authentication, so firewall it)
 
@@ -13,8 +13,11 @@ W8 model. A real client never sends it.
 import json, os, socket, sys, time, numpy as np, torch
 from protocol import *
 from prompts import CALIB, encode
-from net import Conn, pack_bits, server_auth, token_from_env
+from net import Conn, pack_bits, unpack_bits, server_auth, token_from_env
 import fold
+v4 = "v4" in sys.argv                                          # 56-bit chain mode: original weights, 2 trips per block
+if v4:
+    import chainproto as CP, fold56 as F56
 
 opt = lambda name, default=None: next((a[len(name) + 1:] for a in sys.argv if a.startswith(name + "=")), default)
 repo = opt("repo") or {"1.7b": "Qwen/Qwen3-1.7B", "4b": "Qwen/Qwen3-4B"}.get(next((a for a in sys.argv[1:] if a in ("1.7b", "4b")), ""), "Qwen/Qwen3-0.6B")
@@ -32,11 +35,16 @@ if opt("weights"):
 else:
     path = qwen_path(repo); tok_path = os.path.join(path, "tokenizer.json")
     cf = f"merge_calib{tag}.json"
-    if not os.path.exists(cf):
+    if v4: pass
+    elif not os.path.exists(cf):
         json.dump(merge_boost(Qwen3(path, keep_float=False, merge=True, dev=dev), encode(path, CALIB)[:int(opt("calib", 10 ** 6))]), open(cf, "w"), indent=1)
-    model = Qwen3(path, keep_float=False, merge=True, boost=json.load(open(cf)), dev=dev)
+    model = (Qwen3(path, keep_float=False, dev=dev) if v4 else Qwen3(path, keep_float=False, merge=True, boost=json.load(open(cf)), dev=dev))
     model.weights_id = None
-lwe = InnerLWE(); srv = FoldServer(model, lwe, gpu=gpu, gpu_setup=gpu, out_bits=bits)
+lwe = InnerLWE()
+if v4:
+    assert gpu, "v4 needs a CUDA GPU"
+    srv = CP.ChainServer(model); bits = CP.RB
+else: srv = FoldServer(model, lwe, gpu=gpu, gpu_setup=gpu, out_bits=bits)
 print(f"{repo}: loaded in {time.perf_counter() - t:.0f} s", flush=True)
 
 def bundle():
@@ -52,12 +60,19 @@ def bundle():
     for b in model.blocks:
         ks = sorted(k for k, v in b.items() if isinstance(v, np.ndarray)); hdr["block_vectors"].append(ks)
         arrays += [b[k].astype(np.float64) for k in ks]
+    hdr["mode"] = "v4" if v4 else "v3"
+    if v4:                                                     # public numbers the v4 client scales with, + the W multipliers
+        hdr["v4"] = dict(n=CP.N_LWE, N=srv.p.N, inner_seed=21, a_pub_seed=3, pairs=[[r, g] for r, g, _ in srv.pairs],
+                         singles=srv.singles, pub={k: [v["rn"], v["spec"]] for k, v in srv.pub.items()},
+                         W={r: [w["K"], w["Wmax"]] for r, w in srv.W.items()}, W_order=[r for r, _, _ in srv.pairs])
+        arrays += [srv.W[r]["W"].astype(np.int64) for r, _, _ in srv.pairs]
     return hdr, arrays
 
 def c1_rows(name):
     for r0, rows in srv.public_c1(name):
         yield r0, (rows - ((rows >> 31) << 32)).to(torch.int32).cpu().numpy().view(np.uint32)
 
+if opt("prepare") and v4: raise SystemExit("prepare= is v3 only for now")
 if opt("prepare"):                                             # write weights, bundle and C1' to disk, then exit
     out = opt("prepare"); t = time.perf_counter()
     model.weights_id = wid = save_prepared(model, os.path.join(out, "weights"), tok_path)
@@ -74,7 +89,7 @@ if opt("prepare"):                                             # write weights, 
     print(f"C1' for {len(srv.order)} layers written in {time.perf_counter() - t:.0f} s to {cd}", flush=True)
     sys.exit()
 
-if gpu: torch.cuda.empty_cache(); srv.upload_gpu()
+if gpu and not v4: torch.cuda.empty_cache(); srv.upload_gpu()
 print(f"weights on {'GPU' if gpu else 'CPU'}, {bits}-bit replies, weights id {model.weights_id}", flush=True)
 
 def serve(c):
@@ -84,9 +99,24 @@ def serve(c):
         if op == "ping": c.send(dict(op="pong"))
         elif op == "info": c.send(dict(op="info", repo=repo, weights_id=model.weights_id))
         elif op == "bundle": c.send(*bundle())
+        elif op == "c1" and v4:                                # one-time public download, everything in row chunks
+            for kind, name, r0, C1 in srv.public_c1():
+                C1 = C1.cpu().numpy(); c.send(dict(op="c1chunk", kind=kind, name=name, r0=r0), [C1.astype(np.int32) if kind == "top" else C1])
+            c.send(dict(op="c1done"))
         elif op == "c1":                                       # one-time public download, one layer at a time
             for r0, rows in c1_rows(h["name"]): c.send(dict(op="c1chunk", r0=r0), [rows])
             c.send(dict(op="c1done"))
+        elif op == "single":                                   # v4
+            t0 = time.perf_counter(); C = unpack_bits(a[0], 56, int(np.prod(h["shape"]))).reshape(h["shape"])
+            y = srv.single(h["name"], np.asarray(h["toks"]), C)
+            c.send(dict(op="y", shape=list(y.shape), server_s=time.perf_counter() - t0), [pack_bits(y, CP.RB)])
+        elif op == "pair":                                     # v4
+            t0 = time.perf_counter()
+            Cv = unpack_bits(a[0], 56, int(np.prod(h["shape_v"]))).reshape(h["shape_v"])
+            Cx = unpack_bits(a[1], 56, int(np.prod(h["shape_x"]))).reshape(h["shape_x"])
+            t, y = srv.pair(h["r"], h["g"], np.asarray(h["toks"]), Cv, Cx)
+            c.send(dict(op="ty", shape_t=list(t.shape), shape_y=list(y.shape), server_s=time.perf_counter() - t0),
+                   [pack_bits(t, 56), pack_bits(y, CP.RB)])
         elif op == "b": srv.receive_b(a[0]); srv.pos = (); c.send(dict(op="ok"))
         elif op == "lin":
             t0 = time.perf_counter(); y = srv.online_batch(h["name"], np.asarray(h["toks"]), a[0])

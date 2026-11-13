@@ -9,6 +9,9 @@ The client scales every row so that |value| <= 2^54 (Cauchy-Schwarz for single, 
 for the chain), and the server's numbers never wrap."""
 import time, numpy as np, torch
 import fold56 as F
+try:
+    import kernel56 as K                         # fused Triton kernel (falls back to fold56.gemm_mod without Triton)
+except ImportError: K = None
 from fold import NegFFT
 from protocol import dgauss, bf16_to_f32, rmsnorm, silu, mix, _angles
 
@@ -83,6 +86,11 @@ class ChainServer:
 
     def receive_b(self, b): self.b, self.pos = b, {}
 
+    @staticmethod
+    def _mm(W, C, U):                                # W (C - U) mod 2^56 for the tokens of a pass
+        if K is not None and W.is_cuda: return K.gemm56(W, C, U)
+        return F.gemm_mod(W, (C - U) & M56, 7)
+
     def _pads(self, toks):
         if not set(int(t) for t in toks) <= set(self.pos):
             t0 = time.perf_counter(); self.pos = {int(t): i for i, t in enumerate(toks)}
@@ -94,14 +102,14 @@ class ChainServer:
 
     def single(self, name, toks, C):
         t0 = time.perf_counter(); u = self._pads(toks)
-        y = F.gemm_mod(self.Wg[name], (torch.as_tensor(C, device=self.dev) - u(name)) & M56, 7)
+        y = self._mm(self.Wg[name], torch.as_tensor(C, device=self.dev), u(name))
         out = (((y + (1 << (SH - 1))) >> SH) & ((1 << RB) - 1)).cpu().numpy()
         self.time_online += time.perf_counter() - t0; return out
 
     def pair(self, r, g, toks, Cv, Cx):
         t0 = time.perf_counter(); u = self._pads(toks)
-        t = F.gemm_mod(self.Wg[r], (torch.as_tensor(Cv, device=self.dev) - u(r)) & M56, 7)
-        y = F.gemm_mod(self.Wg[g], (self.W[r]["Wg"] * t + torch.as_tensor(Cx, device=self.dev) - u(g)) & M56, 7)
+        t = self._mm(self.Wg[r], torch.as_tensor(Cv, device=self.dev), u(r))
+        y = self._mm(self.Wg[g], (self.W[r]["Wg"] * t + torch.as_tensor(Cx, device=self.dev)) & M56, u(g))
         out = t.cpu().numpy(), (((y + (1 << (SH - 1))) >> SH) & ((1 << RB) - 1)).cpu().numpy()
         self.time_online += time.perf_counter() - t0; return out
 

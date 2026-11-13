@@ -38,8 +38,10 @@ Details, derivations and every measurement are in [`pi/README.md`](pi/README.md)
 
 ## Security
 
-- **Threat model: semi-honest server.** The server follows the protocol and tries to learn your data. It cannot learn
-  your input, but it could return wrong answers: there is no integrity protection.
+- **Privacy does not depend on the server being honest.** The server only ever sees masked numbers, so even a server
+  that breaks the rules cannot read your prompt or the answer. What it does see is how many tokens go in and come out.
+- **Correctness does.** There is no integrity protection: a cheating server could return wrong numbers and make the
+  answer wrong without the client noticing.
 - **Lattice estimates** (malb/lattice-estimator): the per-token masks (n = 1024, q = 2^32, sigma 6.4) come out at
   about 121 bits (95 on the conservative core-SVP measure). That is below the usual 128; n = 2048 would give over 230.
   The outer BFV scheme (N = 4096, Q = 2^80) comes out at about 175 bits. The estimator covers the underlying LWE
@@ -70,7 +72,6 @@ python chat.py                          # chat with the model through the privat
 
 ## Credits
 
-The original protocol sketch (`private_inference_prototype.zip`) came out of a conversation with Claude. Everything
-since was built with Claude Code.
+Built with the assistance of Claude.
 
 MIT License.

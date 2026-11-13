@@ -583,3 +583,51 @@ class FoldClient(Client):
         self.t_mask += t1 - t0; self.t_unmask += t3 - t2
         self.up_bytes += 4 * len(c); self.down_bytes += len(y) * k / 8; self.rounds += 1
         return out
+
+
+# ---------------------------------------------------------------- prepared weights (save once, reload bit-identically)
+def save_prepared(m, out, tokenizer_json):
+    """Write the quantized (and merged) model to the directory `out`: plain .npy files plus meta.json, and return the
+    weights id, a SHA-256 over everything. A server that reloads these files is bit-identical, so a client's cached
+    one-time C1' (keyed by this id) stays valid. Reloading also skips decoding, merging and quantizing (big models)."""
+    import hashlib, shutil
+    os.makedirs(out, exist_ok=True); h = hashlib.sha256()
+    def put(name, a):
+        a = np.ascontiguousarray(a); np.save(os.path.join(out, name + ".npy"), a, allow_pickle=False)
+        h.update(name.encode() + a.dtype.str.encode() + str(a.shape).encode())
+        v = a.reshape(-1).view(np.uint8)
+        for i in range(0, len(v), 1 << 30): h.update(v[i:i + (1 << 30)])
+    meta = dict(d=m.d, L=m.L, vocab=m.vocab, hq=m.hq, hkv=m.hkv, hd=m.hd, eps=m.eps, rope_scale=float(m.rope_scale),
+                merged=m.merged, linears=[], blocks=[])
+    put("inv_freq", np.asarray(m.inv_freq, np.float64)); put("norm", np.asarray(m.norm, np.float64)); put("embed", np.asarray(m.embed))
+    for n, L in m.linears():
+        put(n + ".q", L.q); put(n + ".scale", np.asarray(L.scale, np.float32))
+        meta["linears"].append([n, int(L.q.shape[0]), int(L.q.shape[1]), float(L.row_norm_max)])
+    for i, b in enumerate(m.blocks):
+        rec = dict(scalars={k: float(v) for k, v in b.items() if np.isscalar(v)}, vectors=[], linears=[])
+        for k, v in b.items():
+            if isinstance(v, Linear): rec["linears"].append(k)
+            elif isinstance(v, np.ndarray): rec["vectors"].append(k); put(f"blk{i}.{k}", v.astype(np.float64))
+        meta["blocks"].append(rec)
+    h.update(json.dumps(meta, sort_keys=True).encode())
+    meta["weights_id"] = h.hexdigest()[:32]
+    shutil.copy(tokenizer_json, os.path.join(out, "tokenizer.json"))
+    json.dump(meta, open(os.path.join(out, "meta.json"), "w"), indent=1)
+    return meta["weights_id"]
+
+def load_prepared(d):
+    """Inverse of save_prepared: a Qwen3 object (all fields forward_token, forward_batch and the servers use)."""
+    meta = json.load(open(os.path.join(d, "meta.json")))
+    get = lambda name: np.load(os.path.join(d, name + ".npy"), allow_pickle=False)
+    m = Qwen3.__new__(Qwen3)
+    for k in ("d", "L", "vocab", "hq", "hkv", "hd", "eps", "rope_scale", "merged"): setattr(m, k, meta[k])
+    m.inv_freq, m.norm, m.embed, m.weights_id = get("inv_freq"), get("norm"), get("embed"), meta["weights_id"]
+    lin = {}
+    for n, r, k, rn in meta["linears"]:
+        L = Linear.__new__(Linear); L.q, L.scale = get(n + ".q"), get(n + ".scale")
+        L.W, L.packed, L._t, L.row_norm_max = None, None, None, rn; lin[n] = L
+    m.head, m.blocks = lin["head"], []
+    for i, rec in enumerate(meta["blocks"]):
+        b = dict(rec["scalars"]); b.update({k: get(f"blk{i}.{k}") for k in rec["vectors"]})
+        b.update({k: lin[f"{i}.{k}"] for k in rec["linears"]}); m.blocks.append(b)
+    return m

@@ -1,11 +1,15 @@
 """Private inference server (v3 + merge) over TCP. It holds the public weights and sees only masked data.
 
-  python server.py [repo=<HF id> | 1.7b | 4b] [bits=20] [gpuload] [port=7000] [host=127.0.0.1]  (host=0.0.0.0 to accept remote clients; there is no authentication, so firewall it)
+  python server.py [repo=<HF id> | 1.7b | 4b] [bits=20] [gpuload] [weights=DIR] [prepare=DIR] [port=7000] [host=127.0.0.1]  (host=0.0.0.0 to accept remote clients; there is no authentication, so firewall it)
 
 Per connection it serves, in order: the public client bundle (everything except the big weight matrices), the
 public one-time C1' (computed on request), the client's per-batch upload b, then the online requests.
 `plaincheck` is for TESTS ONLY: the client sends its tokens in the clear so the server can compare with the plain
-W8 model. A real client never sends it."""
+W8 model. A real client never sends it.
+
+`prepare=DIR`: load and quantize the model, then write to DIR the prepared weights (DIR/weights), the public bundle
+(DIR/bundle_<id>) and the one-time C1' (DIR/c1_<id>), and exit. The last two are what a client caches.
+`weights=DIR/weights`: serve those prepared weights (bit-identical every time, and no decoding or quantizing)."""
 import json, os, socket, sys, time, numpy as np, torch
 from protocol import *
 from prompts import CALIB, encode
@@ -22,24 +26,27 @@ if not token and host not in ("127.0.0.1", "localhost"):
 gpu = torch.cuda.is_available() and "cpu" not in sys.argv
 dev = "cuda" if gpu and "gpuload" in sys.argv else None
 
-path = qwen_path(repo)
-cf = f"merge_calib{tag}.json"
-if not os.path.exists(cf):
-    json.dump(merge_boost(Qwen3(path, keep_float=False, merge=True, dev=dev), encode(path, CALIB)[:int(opt("calib", 10 ** 6))]), open(cf, "w"), indent=1)
 t = time.perf_counter()
-model = Qwen3(path, keep_float=False, merge=True, boost=json.load(open(cf)), dev=dev)
+if opt("weights"):
+    model = load_prepared(opt("weights")); tok_path = os.path.join(opt("weights"), "tokenizer.json")
+else:
+    path = qwen_path(repo); tok_path = os.path.join(path, "tokenizer.json")
+    cf = f"merge_calib{tag}.json"
+    if not os.path.exists(cf):
+        json.dump(merge_boost(Qwen3(path, keep_float=False, merge=True, dev=dev), encode(path, CALIB)[:int(opt("calib", 10 ** 6))]), open(cf, "w"), indent=1)
+    model = Qwen3(path, keep_float=False, merge=True, boost=json.load(open(cf)), dev=dev)
+    model.weights_id = None
 lwe = InnerLWE(); srv = FoldServer(model, lwe, gpu=gpu, gpu_setup=gpu, out_bits=bits)
-if gpu: torch.cuda.empty_cache(); srv.upload_gpu()
-print(f"{repo}: loaded in {time.perf_counter() - t:.0f} s, weights on {'GPU' if gpu else 'CPU'}, {bits}-bit replies", flush=True)
+print(f"{repo}: loaded in {time.perf_counter() - t:.0f} s", flush=True)
 
 def bundle():
     """Public data the client needs besides the weight matrices: config, norm weights, per-row scales, embedding table."""
-    hdr = dict(op="bundle", repo=repo, d=model.d, L=model.L, vocab=model.vocab, hq=model.hq, hkv=model.hkv, hd=model.hd,
+    hdr = dict(op="bundle", repo=repo, weights_id=model.weights_id, d=model.d, L=model.L, vocab=model.vocab, hq=model.hq, hkv=model.hkv, hd=model.hd,
                eps=model.eps, rope_scale=model.rope_scale, out_bits=bits, lwe_seed=lwe.seed, a_pub_seed=2,
                linears=[[n, *L.q.shape, float(L.row_norm_max)] for n, L in model.linears()],
                blocks=[{k: (v if np.isscalar(v) else None) for k, v in b.items() if not isinstance(v, Linear)} for b in model.blocks])
     arrays = [np.asarray(model.inv_freq, np.float64), np.asarray(model.norm, np.float64), np.asarray(model.embed),
-              np.frombuffer(open(os.path.join(path, "tokenizer.json"), "rb").read(), np.uint8)]
+              np.frombuffer(open(tok_path, "rb").read(), np.uint8)]
     arrays += [L.scale.astype(np.float64) for _, L in model.linears()]
     hdr["block_vectors"] = []
     for b in model.blocks:
@@ -47,15 +54,38 @@ def bundle():
         arrays += [b[k].astype(np.float64) for k in ks]
     return hdr, arrays
 
+def c1_rows(name):
+    for r0, rows in srv.public_c1(name):
+        yield r0, (rows - ((rows >> 31) << 32)).to(torch.int32).cpu().numpy().view(np.uint32)
+
+if opt("prepare"):                                             # write weights, bundle and C1' to disk, then exit
+    out = opt("prepare"); t = time.perf_counter()
+    model.weights_id = wid = save_prepared(model, os.path.join(out, "weights"), tok_path)
+    print(f"weights {wid} saved in {time.perf_counter() - t:.0f} s", flush=True)
+    bd = os.path.join(out, "bundle_" + wid); os.makedirs(bd, exist_ok=True); hdr, arrays = bundle()
+    for i, a in enumerate(arrays): np.save(os.path.join(bd, f"{i}.npy"), np.ascontiguousarray(a), allow_pickle=False)
+    json.dump(dict(hdr, arrays=[[np.asarray(a).dtype.name, list(np.shape(a))] for a in arrays]), open(os.path.join(bd, "header.json"), "w"))
+    cd = os.path.join(out, "c1_" + wid); os.makedirs(cd, exist_ok=True); t = time.perf_counter()
+    for n in srv.order:
+        mm = np.lib.format.open_memmap(os.path.join(cd, n + ".npy"), "w+", np.uint32, (srv.lin[n].q.shape[0], fold.N))
+        for r0, rows in c1_rows(n): mm[r0:r0 + len(rows)] = rows
+        mm.flush(); del mm
+    open(os.path.join(cd, "complete"), "w").close()
+    print(f"C1' for {len(srv.order)} layers written in {time.perf_counter() - t:.0f} s to {cd}", flush=True)
+    sys.exit()
+
+if gpu: torch.cuda.empty_cache(); srv.upload_gpu()
+print(f"weights on {'GPU' if gpu else 'CPU'}, {bits}-bit replies, weights id {model.weights_id}", flush=True)
+
 def serve(c):
     while True:
         h, a = c.recv(); op = h["op"]
         if op == "bye": return
         if op == "ping": c.send(dict(op="pong"))
+        elif op == "info": c.send(dict(op="info", repo=repo, weights_id=model.weights_id))
         elif op == "bundle": c.send(*bundle())
         elif op == "c1":                                       # one-time public download, one layer at a time
-            for r0, rows in srv.public_c1(h["name"]):
-                c.send(dict(op="c1chunk", r0=r0), [(rows - ((rows >> 31) << 32)).to(torch.int32).cpu().numpy().view(np.uint32)])
+            for r0, rows in c1_rows(h["name"]): c.send(dict(op="c1chunk", r0=r0), [rows])
             c.send(dict(op="c1done"))
         elif op == "b": srv.receive_b(a[0]); srv.pos = (); c.send(dict(op="ok"))
         elif op == "lin":

@@ -46,8 +46,13 @@ class Conn:
 
 # ---------------------------------------------------------------- password (pre-shared token)
 def token_from_env():
-    """The password: environment variable PI_TOKEN (not a command-line argument, which other users and shell history see)."""
+    """The password: environment variable PI_TOKEN, or the first line of the file named by PI_TOKEN_FILE (default
+    ~/.config/pi/token if it exists). Never a command-line argument, which other users and shell history can see."""
     t = os.environ.get("PI_TOKEN", "")
+    f = os.environ.get("PI_TOKEN_FILE") or os.path.expanduser("~/.config/pi/token")
+    if not t and "PI_TOKEN" not in os.environ and os.path.exists(f):
+        if os.stat(f).st_mode & 0o077: raise SystemExit(f"{f} can be read by other users: run chmod 600 {f}")
+        t = open(f).readline().strip()
     if t and len(t) < 16: raise SystemExit("PI_TOKEN is too short: use at least 16 characters (see README)")
     return t
 

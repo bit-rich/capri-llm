@@ -1,0 +1,37 @@
+{
+ "repo": "Qwen/Qwen3-32B",
+ "host": "54.215.162.191",
+ "round_trip_ms": 16.916919999857782,
+ "k": 0,
+ "reply_bits": 20,
+ "results": [
+  {
+   "prompt": "The capital of France is",
+   "text": " Paris. The capital of Germany is Berlin. The capital of",
+   "prompt_tokens": 5,
+   "new_tokens": 12,
+   "first_token_s": 27.262301795002713,
+   "total_s": 87.81221018200085,
+   "reply_tokens_per_s": 0.1816683178064399,
+   "round_trips": 1560,
+   "up_MB": 180.738628,
+   "down_MB": 188.225127,
+   "server_compute_s": 13.60899259099665,
+   "private_eq_w8": false
+  },
+  {
+   "prompt": "def fibonacci(n):\n    \"\"\"Return the n-th Fibonacci number.\"\"\"\n",
+   "text": "    if n < 0:\n        raise ValueError(\"Negative",
+   "prompt_tokens": 13,
+   "new_tokens": 12,
+   "first_token_s": 61.52417489900108,
+   "total_s": 123.19671653099795,
+   "reply_tokens_per_s": 0.17836138594121106,
+   "round_trips": 1560,
+   "up_MB": 270.921717,
+   "down_MB": 279.975723,
+   "server_compute_s": 10.43595362599649,
+   "private_eq_w8": true
+  }
+ ]
+}

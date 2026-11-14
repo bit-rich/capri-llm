@@ -400,7 +400,7 @@ class Server:
         return y
 
 class Client:
-    def __init__(self, server, lwe, bfv, seed=7, gpu=False):
+    def __init__(self, server, lwe, bfv, seed=None, gpu=False):   # seed=None: secrets from OS entropy (tests may fix it)
         self.srv, self.lwe, self.bfv, self.gpu = server, lwe, bfv, gpu
         self.rng = np.random.default_rng(seed)
         self.t_mask = self.t_unmask = 0.0

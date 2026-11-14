@@ -159,7 +159,7 @@ class InnerLWE:
 class BFV:
     N = 2048
 
-    def __init__(self, seed=1):
+    def __init__(self, seed=None):                  # None: secret key and encryption randomness from OS entropy
         N = self.N
         self.p = [find_ntt_prime(27, N)]
         self.p.append(find_ntt_prime(27, N, below=self.p[0]))
@@ -226,7 +226,7 @@ class BFV32:
     limb. Download per row per token = 2 x 30 bits instead of 4 digits x 2 limbs x 2 x 27 bits."""
     N = 4096
 
-    def __init__(self, seed=1):
+    def __init__(self, seed=None):                  # None: secret key and encryption randomness from OS entropy
         N = self.N
         self.p = []
         for _ in range(3):

@@ -92,6 +92,10 @@ def pack_bits(y, k):
 
 def unpack_bits(b, k, count):
     g = next(g for g in (1, 2, 4, 8) if g * k % 8 == 0); nb = g * k // 8
+    if g == 1:                                                 # whole bytes per value (24, 56, ...): no regrouping
+        b = b.reshape(-1, nb)[:count]; v = b[:, 0].astype(np.int64)
+        for i in range(1, nb): v |= b[:, i].astype(np.int64) << (8 * i)
+        return v
     b = b.reshape(-1, nb); w = np.zeros((len(b), 8), np.uint8); w[:, :nb] = b
     v = w.reshape(-1).view("<u8"); m = np.uint64((1 << k) - 1)
     return np.stack([(v >> np.uint64(j * k)) & m for j in range(g)], 1).reshape(-1)[:count].astype(np.int64)

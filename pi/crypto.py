@@ -50,7 +50,9 @@ def primitive_2n_root(p, N):
     raise ValueError
 
 def dgauss(rng, shape, sigma):
-    return np.rint(rng.normal(0, sigma, size=shape)).astype(np.int64)
+    """Rounded Gaussian. Drawn in float32 (the rounding to integers makes float64 pointless) for speed."""
+    x = rng.standard_normal(size=shape, dtype=np.float32); x *= sigma
+    return np.rint(x).astype(np.int64)
 
 # ---------------------------------------------------------------- negacyclic NTT
 class NTT:

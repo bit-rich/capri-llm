@@ -315,9 +315,9 @@ def attend(q, K, V):
     """GQA: q (hq, hd); K, V (T, hkv, hd). Query head h reads kv head h // (hq // hkv)."""
     hq, hd = q.shape; hkv = K.shape[1]
     qg = q.reshape(hkv, hq // hkv, hd)
-    s = np.einsum("grd,tgd->grt", qg, K) / np.sqrt(hd)
+    s = np.matmul(qg, K.transpose(1, 2, 0)) / np.sqrt(hd)                      # (hkv, group, T), BLAS
     s = np.exp(s - s.max(-1, keepdims=True)); s /= s.sum(-1, keepdims=True)
-    return np.einsum("grt,tgd->grd", s, V).reshape(hq * hd)
+    return np.matmul(s, V.transpose(1, 0, 2)).reshape(hq * hd)
 
 def delta_mix(m, b, rows, layer_cache, t0):
     """Gated DeltaNet linear attention (Qwen3.5 family), client side, token by token. rows (T, R) = the block's input
@@ -338,8 +338,8 @@ def delta_mix(m, b, rows, layer_cache, t0):
         k = k / np.sqrt((k * k).sum(-1, keepdims=True) + 1e-6)
         beta, g = sigmoid(bb), -np.exp(b["A_log"]) * np.logaddexp(0, aa + b["dt_bias"])
         S = S * np.exp(g)[:, None, None]
-        S = S + k[:, :, None] * ((v - np.einsum("hkv,hk->hv", S, k)) * beta[:, None])[:, None, :]
-        o = np.einsum("hkv,hk->hv", S, q)
+        S = S + k[:, :, None] * ((v - np.matmul(k[:, None, :], S)[:, 0]) * beta[:, None])[:, None, :]   # batched BLAS
+        o = np.matmul(q[:, None, :], S)[:, 0]
         o = o / np.sqrt((o * o).mean(-1, keepdims=True) + m.eps) * b["gnorm"] * silu(z.reshape(nv, dv))
         out.append(o.reshape(-1)); hist.append((win, S)); ph.append(None)
     for j in range(max(0, t0 - 1)):

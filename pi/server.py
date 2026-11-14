@@ -44,7 +44,7 @@ lwe = InnerLWE()
 if v4:
     assert gpu, "v4 needs a CUDA GPU"
     srv = CP.ChainServer(model); bits = CP.RB
-    if model.weights_id is None: model.weights_id = weights_hash(model, extra=f"v4 N={srv.p.N}")
+    model.weights_id = weights_hash(model, extra=f"v4 N={srv.p.N}")     # same id whether loaded from HF or prepared
 else: srv = FoldServer(model, lwe, gpu=gpu, gpu_setup=gpu, out_bits=bits)
 print(f"{repo}: loaded in {time.perf_counter() - t:.0f} s", flush=True)
 
@@ -73,7 +73,25 @@ def c1_rows(name):
     for r0, rows in srv.public_c1(name):
         yield r0, (rows - ((rows >> 31) << 32)).to(torch.int32).cpu().numpy().view(np.uint32)
 
-if opt("prepare") and v4: raise SystemExit("prepare= is v3 only for now")
+if opt("prepare") and v4:                                      # weights, bundle and C1' in the client's cache layout
+    out = opt("prepare"); t = time.perf_counter(); wid = model.weights_id
+    save_prepared(model, os.path.join(out, "weights"), tok_path)
+    print(f"weights saved in {time.perf_counter() - t:.0f} s (v4 id {wid})", flush=True)
+    bd = os.path.join(out, "bundle_" + wid); os.makedirs(bd, exist_ok=True); hdr, arrays = bundle()
+    for i, a in enumerate(arrays): np.save(os.path.join(bd, f"{i}.npy"), np.ascontiguousarray(a), allow_pickle=False)
+    json.dump(dict(hdr, arrays=[[np.asarray(a).dtype.name, list(np.shape(a))] for a in arrays]), open(os.path.join(bd, "header.json"), "w"))
+    cd = os.path.join(out, "c1v4_" + wid); os.makedirs(cd, exist_ok=True); t = time.perf_counter(); files, index = {}, []
+    rows = {n: L.q.shape[0] for n, L in model.linears()}
+    for kind, name, r0, C1 in srv.public_c1():
+        C1 = C1.cpu().numpy(); C1 = C1.astype(np.int32) if kind == "top" else C1
+        if name not in files:
+            files[name] = np.lib.format.open_memmap(os.path.join(cd, name + ".npy"), "w+", C1.dtype, (rows[name.split("@")[0]], srv.p.N))
+            index.append([kind, name, rows[name.split("@")[0]]])
+        files[name][r0:r0 + len(C1)] = C1
+    for f in files.values(): f.flush()
+    json.dump(index, open(os.path.join(cd, "index.json"), "w")); open(os.path.join(cd, "complete"), "w").close()
+    print(f"C1' written in {time.perf_counter() - t:.0f} s to {cd}", flush=True)
+    sys.exit()
 if opt("prepare"):                                             # write weights, bundle and C1' to disk, then exit
     out = opt("prepare"); t = time.perf_counter()
     model.weights_id = wid = save_prepared(model, os.path.join(out, "weights"), tok_path)

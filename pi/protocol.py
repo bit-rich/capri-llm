@@ -319,7 +319,51 @@ def attend(q, K, V):
     s = np.exp(s - s.max(-1, keepdims=True)); s /= s.sum(-1, keepdims=True)
     return np.matmul(s, V.transpose(1, 0, 2)).reshape(hq * hd)
 
+_DELTA_T = {}
+def _delta_mix_gpu(m, b, rows, layer_cache, t0):
+    """delta_mix on the GPU (float64, same arithmetic): the per-token recurrence is ~15 small kernels per layer
+    instead of numpy calls. States are kept as GPU tensors in the same (states, placeholders) lists."""
+    import torch
+    nk, nv, dk, dv, ks = m.lin_dims; cd = 2 * nk * dk + nv * dv; rep_ = nv // nk
+    P = _DELTA_T.get(id(b))
+    if P is None or P["src"] is not b["conv"]:                 # ids get reused after a model is freed: check the source
+        P = _DELTA_T[id(b)] = {k: torch.as_tensor(np.ascontiguousarray(b[k]), device="cuda") for k in ("conv", "A_log", "dt_bias", "gnorm")}
+        P["src"] = b["conv"]
+        P["convT"] = P["conv"].T.contiguous(); P["negA"] = -P["A_log"].exp()
+    hist, ph = layer_cache
+    win, S = hist[-1] if hist else (torch.zeros((ks - 1, cd), dtype=torch.float64, device="cuda"),
+                                    torch.zeros((nv, dk, dv), dtype=torch.float64, device="cuda"))
+    R = torch.as_tensor(rows, device="cuda"); out = []
+    for r in R:
+        xq, z, bb, aa = torch.split(r, [cd, nv * dv, nv, nv])
+        full = torch.cat([win, xq[None]]); win = full[1:]
+        y = torch.nn.functional.silu((full * P["convT"]).sum(0))
+        q, k, v = torch.split(y, [nk * dk, nk * dk, nv * dv])
+        q, k, v = q.view(nk, dk).repeat_interleave(rep_, 0), k.view(nk, dk).repeat_interleave(rep_, 0), v.view(nv, dv)
+        q = q * torch.rsqrt((q * q).sum(-1, keepdim=True) + 1e-6) / dk ** 0.5
+        k = k * torch.rsqrt((k * k).sum(-1, keepdim=True) + 1e-6)
+        beta, g = torch.sigmoid(bb), P["negA"] * torch.nn.functional.softplus(aa + P["dt_bias"])
+        S = S * g.exp()[:, None, None]
+        S = S + k[:, :, None] * ((v - torch.bmm(k[:, None, :], S)[:, 0]) * beta[:, None])[:, None, :]
+        o = torch.bmm(q[:, None, :], S)[:, 0]
+        o = o * torch.rsqrt((o * o).mean(-1, keepdim=True) + m.eps) * P["gnorm"] * torch.nn.functional.silu(z.view(nv, dv))
+        out.append(o.reshape(-1)); hist.append((win, S)); ph.append(None)
+    for j in range(max(0, t0 - 1)):
+        if hist[j] is None: continue
+        hist[j] = None
+    return torch.stack(out).cpu().numpy()
+
 def delta_mix(m, b, rows, layer_cache, t0):
+    if _use_gpu_mix(): return _delta_mix_gpu(m, b, rows, layer_cache, t0)
+    return _delta_mix_np(m, b, rows, layer_cache, t0)
+
+def _use_gpu_mix():
+    if os.environ.get("PI_MIX_CPU"): return False
+    try:
+        import torch; return torch.cuda.is_available()
+    except ImportError: return False
+
+def _delta_mix_np(m, b, rows, layer_cache, t0):
     """Gated DeltaNet linear attention (Qwen3.5 family), client side, token by token. rows (T, R) = the block's input
     projection [q k v | z | b | a]. State: the last (kernel - 1) conv inputs and the recurrent matrix S per value head.
     layer_cache = (states, placeholders): states[t] is the state after token t; older ones are dropped except what a

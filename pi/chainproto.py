@@ -78,7 +78,7 @@ class ChainServer:
     def __init__(self, model, dev="cuda", p=None):
         self.p, self.dev, self.model = p or F.P(), dev, model
         self.lin = dict(model.linears()); self.order = list(self.lin)
-        self.Wg = {n: torch.as_tensor(L.q, device=dev) for n, L in self.lin.items()}
+        self.Wg = self._place(dev)
         self.a = {n: inner_a(lid, L.q.shape[1]) for lid, (n, L) in enumerate(self.lin.items())}
         self.pairs, self.singles = [], ["0.qkv"]         # the trips: (R, G, norm weight) and single matrices
         for i, b in enumerate(model.blocks):
@@ -101,6 +101,17 @@ class ChainServer:
         self.pads = F.Pads(self.p, [self.a[n] for n in self.order], [self.lin[n].q.shape[1] for n in self.order], dev)
         self.hint = None; self.time_online = self.time_pads = self.time_c1 = 0.0
 
+    def _place(self, dev):
+        """Weights on the GPU(s): in order, moving to the next GPU when one is full (big models on small GPUs)."""
+        if dev != "cuda" or torch.cuda.device_count() < 2: return {n: torch.as_tensor(L.q, device=dev) for n, L in self.lin.items()}
+        from protocol import gpu_free
+        free = gpu_free(); free[0] -= 3 << 30                  # GPU 0 also does the pads and the one-time C1' work
+        out, d = {}, 0
+        for n, L in self.lin.items():
+            while L.q.nbytes > free[d] and d + 1 < len(free): d += 1
+            out[n] = torch.as_tensor(L.q, device=f"cuda:{d}"); free[d] -= L.q.nbytes
+        return out
+
     def public_c1(self, rows=4096):
         """One-time, public. Yields (kind, name, r0, rows of C1') in row chunks, with kind 'full' (residual rows,
         all 56 bits) or 'top' (everything else, compressed to 32 bits)."""
@@ -108,23 +119,26 @@ class ChainServer:
         if self.hint is None: self.hint = F.Hint(self.p, self.a_pub, self.dev)
         G = lambda n: self.hint.G(self.a[n], self.lin[n].q.shape[1])
         for n in self.singles:
-            Gn = G(n); W = self.Wg[n]
+            W = self.Wg[n]; Gn = G(n).to(W.device)
             for r0 in range(0, W.shape[0], rows):
                 c = F.compress(F.c1_single(W[r0:r0 + rows], Gn))
                 self.time_c1 += time.perf_counter() - t0; yield "top", n, r0, c; t0 = time.perf_counter()
         for r, g, _ in self.pairs:
-            Gr, Gg = G(r), G(g); Wg = self.Wg[g]
+            Wr, Wg = self.Wg[r], self.Wg[g]; Gr, Gg = G(r).to(Wr.device), G(g).to(Wg.device)
             for r0 in range(0, Wg.shape[0], rows):
-                ct, cy = F.c1_chain(self.Wg[r], Wg[r0:r0 + rows], self.W[r]["Wg"], Gr, Gg)
+                ct, cy = F.c1_chain(Wr, Wg[r0:r0 + rows], self.W[r]["Wg"].to(Wg.device), Gr, Gg)
                 self.time_c1 += time.perf_counter() - t0
                 if r0 == 0: yield "full", r, 0, ct
                 yield "top", g + "@" + r, r0, F.compress(cy); t0 = time.perf_counter()
 
     def receive_b(self, b): self.b, self.pos = b, {}
 
-    @staticmethod
-    def _mm(W, C, U):                                # W (C - U) mod 2^56 for the tokens of a pass
-        if K is not None and W.is_cuda: return K.gemm56(W, C, U)
+    _FUSED = None
+    @classmethod
+    def _mm(cls, W, C, U):                           # W (C - U) mod 2^56 for the tokens of a pass
+        if cls._FUSED is None:                       # the Triton int8 kernel needs Ampere or newer (T4 = Turing: no)
+            cls._FUSED = K is not None and W.is_cuda and torch.cuda.get_device_capability(W.device) >= (8, 0)
+        if cls._FUSED: return K.gemm56(W, C, U)
         return F.gemm_mod(W, (C - U) & M56, 7)
 
     def _pads(self, toks):
@@ -138,14 +152,16 @@ class ChainServer:
 
     def single(self, name, toks, C):
         t0 = time.perf_counter(); u = self._pads(toks)
-        y = self._mm(self.Wg[name], torch.as_tensor(C, device=self.dev) << self.comp[name], u(name))
+        W = self.Wg[name]
+        y = self._mm(W, torch.as_tensor(C, device=W.device) << self.comp[name], u(name).to(W.device))
         out = (((y + (1 << (SH - 1))) >> SH) & ((1 << RB) - 1)).cpu().numpy()
         self.time_online += time.perf_counter() - t0; return out
 
     def pair(self, r, g, toks, Cv, Cx):
         t0 = time.perf_counter(); u = self._pads(toks)
-        t = self._mm(self.Wg[r], torch.as_tensor(Cv, device=self.dev) << self.comp[r], u(r))
-        y = self._mm(self.Wg[g], (self.W[r]["Wg"] * t + (torch.as_tensor(Cx, device=self.dev) << self.comp[g])) & M56, u(g))
+        Wr, Wg = self.Wg[r], self.Wg[g]
+        t = self._mm(Wr, torch.as_tensor(Cv, device=Wr.device) << self.comp[r], u(r).to(Wr.device)).to(Wg.device)
+        y = self._mm(Wg, (self.W[r]["Wg"].to(Wg.device) * t + (torch.as_tensor(Cx, device=Wg.device) << self.comp[g])) & M56, u(g).to(Wg.device))
         lo = self.comp[r + "@lo"]
         tw = ((t + ((1 << (lo - 1)) if lo else 0)) >> lo) & ((1 << RBR) - 1)          # bits lo .. lo + RBR of t
         out = tw.cpu().numpy(), (((y + (1 << (SH - 1))) >> SH) & ((1 << RB) - 1)).cpu().numpy()

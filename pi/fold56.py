@@ -106,7 +106,7 @@ def c1_chain(R, Gm, Wt, Gv, Gx, chunk=512):
     """C1' of a chained trip: (residual rows of R, chain rows of G), mod 2^56. Wt (d,) int64 multipliers."""
     ts, ys = [], []
     for i in range(0, Gv.shape[1], chunk):
-        t = gemm_mod(R, Gv[:, i:i + chunk].T.contiguous(), 8)                 # (c, d) mod 2^64
+        t = gemm_mod(R, Gv[:, i:i + chunk].T.contiguous(), 8).to(Gm.device)    # (c, d) mod 2^64 (R, G may be on two GPUs)
         ys.append(gemm_mod(Gm, (t * Wt + Gx[:, i:i + chunk].T).contiguous(), 8)); ts.append(t)
     t, y = torch.cat(ts), torch.cat(ys)
     return (((t + 128) >> 8) & M56).T, (((y + 128) >> 8) & M56).T

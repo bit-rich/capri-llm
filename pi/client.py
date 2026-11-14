@@ -13,7 +13,7 @@ scales, embedding table) can only make the answers wrong, not leak the input.
 C1' and the bundle on disk instead of downloading them again on every run."""
 import json, os, socket, sys, time, types, numpy as np, torch
 import fold
-from protocol import InnerLWE, FoldClient, forward_batch, cache_keep
+from protocol import InnerLWE, FoldClient, forward_batch, cache_keep, new_cache
 from prompts import PROMPTS, NEW_TOKENS
 
 opt = lambda name, default=None: next((a[len(name) + 1:] for a in sys.argv if a.startswith(name + "=")), default)
@@ -62,7 +62,7 @@ print(f"one-time + per-batch: {time.perf_counter() - t:.0f} s, up {(c.sent - up0
 # ---------------------------------------------------------------- online
 results = []
 for p, ids in zip(prompts, ids_all):
-    cache = [([], []) for _ in model.blocks]
+    cache = new_cache(model)
     u0, d0, r0, s0, t0 = c.sent, c.recvd, client.rounds, remote.server_s, time.perf_counter()
     client.begin_pass(len(ids)); lg = run(ids, cache, n_head=1)
     gen = [int(lg[-1].argmax())]; t_first = time.perf_counter() - t0

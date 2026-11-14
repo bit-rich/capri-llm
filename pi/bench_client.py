@@ -26,9 +26,15 @@ a = {i: CP.inner_a(i, w) for i, w in enumerate(ins)}; M = CP.Masks(a, dev); al =
 X = [rng.integers(0, 1 << 50, (1, w)) for w in ins]
 yc = rng.integers(0, 1 << 24, outs_chain); yr = rng.integers(0, 1 << 55, outs_res); ycb, yrb = pack_bits(yc, 24), pack_bits(yr, 56)
 z = rng.integers(0, 1 << 56, outs_chain + outs_res); y = rng.integers(0, 1 << 56, outs_chain + outs_res)
-res = {"masks": timeit(lambda: [M(i, al, w).cpu() for i, w in enumerate(ins)]),
-       "mask noise": timeit(lambda: [dgauss(rng, (1, w), 6.4) for w in ins]),
-       "packing uploads": timeit(lambda: [pack_bits(x, 56) for x in X]),
+gen = torch.Generator(device=dev); gen.manual_seed(1)
+def masked_upload(pre, i, w, x):                              # what ChainClient._mask does for a network link
+    e = torch.round(torch.randn((1, w), generator=gen, device=dev, dtype=torch.float32) * 6.4).long()
+    C = (pre[i][:, :w] + e + torch.as_tensor(x, device=dev)) & ((1 << 56) - 1)
+    return C.view(torch.uint8).view(-1, 8)[:, :7].contiguous().cpu()
+def all_uploads():
+    pre = M.all(al)                                          # every layer's A alpha, once per pass
+    return [masked_upload(pre, i, w, x) for (i, w), x in zip(enumerate(ins), X)]
+res = {"masks + noise + packing (GPU)": timeit(all_uploads),
        "unpacking replies": timeit(lambda: (unpack_bits(ycb, 24, outs_chain), unpack_bits(yrb, 56, outs_res))),
        "unmasking": timeit(lambda: (((y - z + (1 << 54)) & ((1 << 55) - 1)) - (1 << 54)) / 3.0)}
 m = type("M", (), {})(); m.eps = 1e-6

@@ -100,14 +100,18 @@ class RemoteChainServer:
     def receive_b(self, b):
         self.c.send(dict(op="b"), [b]); assert self.c.recv()[0]["op"] == "ok"
 
+    wants_bytes = True                                      # the client packs uploads on its GPU
+
+    def _bytes(self, C): return C.data if hasattr(C, "data") and not isinstance(C, np.ndarray) else pack_bits(C, 56)
+
     def single(self, name, toks, C):
-        self.c.send(dict(op="single", name=name, toks=[int(t) for t in toks], shape=list(C.shape)), [pack_bits(C, 56)])
+        self.c.send(dict(op="single", name=name, toks=[int(t) for t in toks], shape=list(C.shape)), [self._bytes(C)])
         h, a = self.c.recv(); self.server_s += h["server_s"]
         return unpack_bits(a[0], self.CP.RB, int(np.prod(h["shape"]))).reshape(h["shape"])
 
     def pair(self, r, g, toks, Cv, Cx):
         self.c.send(dict(op="pair", r=r, g=g, toks=[int(t) for t in toks], shape_v=list(Cv.shape), shape_x=list(Cx.shape)),
-                    [pack_bits(Cv, 56), pack_bits(Cx, 56)])
+                    [self._bytes(Cv), self._bytes(Cx)])
         h, a = self.c.recv(); self.server_s += h["server_s"]
         return (unpack_bits(a[0], 56, int(np.prod(h["shape_t"]))).reshape(h["shape_t"]),
                 unpack_bits(a[1], self.CP.RB, int(np.prod(h["shape_y"]))).reshape(h["shape_y"]))

@@ -32,6 +32,16 @@ class Masks:
     def __init__(self, a, dev):
         self.f, self.dev = NegFFT(N_LWE, dev), dev
         self.FA = {k: self.f.fwd(F._limbs16(v, 4, dev)) for k, v in a.items()}         # (nb, 4, n/2)
+    def all(self, alphas):
+        """A_l alpha for every layer l in one batched FFT: {name: (T, blocks * n)}."""
+        if not hasattr(self, "_cat"):
+            self._names = list(self.FA); self._cat = torch.cat([self.FA[k] for k in self._names])
+            self._cuts = np.cumsum([0] + [len(self.FA[k]) for k in self._names])
+        FS = self.f.fwd(torch.as_tensor(alphas, dtype=torch.float64, device=self.dev))
+        P = torch.round(self.f.inv(self._cat[None] * FS[:, None, None, :])).long()      # (T, blocks, 4, n)
+        out = sum(P[:, :, k] << (16 * k) for k in range(4)) & M56
+        return {k: out[:, self._cuts[j]:self._cuts[j + 1]].reshape(len(alphas), -1) for j, k in enumerate(self._names)}
+
     def __call__(self, name, alphas, din):
         FS = self.f.fwd(torch.as_tensor(alphas, dtype=torch.float64, device=self.dev))   # (T, n/2)
         P = torch.round(self.f.inv(self.FA[name] * FS[:, None, None, :])).long()       # (T, nb, 4, n)
@@ -114,11 +124,17 @@ class ChainServer:
         self.time_online += time.perf_counter() - t0; return out
 
 
+class Packed:
+    """Masked values already packed to 7 bytes each (little-endian), with their shape."""
+    def __init__(self, data, shape): self.data, self.shape = data, shape
+    @property
+    def size(self): return int(np.prod(self.shape))
+
 class ChainClient:
     def __init__(self, srv, seed=None, dev="cuda"):
         """seed=None (the default, and the only safe choice outside tests): the secrets (alphas, s, errors) come from
         fresh operating-system entropy. A fixed seed makes them reproducible by anyone, i.e. no privacy."""
-        self.srv, self.dev, self.rng = srv, dev, np.random.default_rng(seed)
+        self.srv, self.dev, self.rng = srv, dev, np.random.default_rng(seed); self.gen = None
         self.p, self.pub, self.W = srv.p, srv.pub, srv.W            # public (a real client gets these in the bundle)
         self.a = {n: inner_a(lid, srv.lin[n].q.shape[1]) for lid, n in enumerate(srv.order)}   # derived locally
         self.masks = Masks(self.a, dev)
@@ -143,9 +159,20 @@ class ChainClient:
     def begin_pass(self, T):
         self.toks = np.arange(self.tok + 1, self.tok + 1 + T); self.tok += T
         assert self.tok < len(self.alphas), "out of offline material"
+        self.pre = self.masks.all(self.alphas[self.toks]) if T <= 8 else None     # every layer's A alpha at once
 
     def _mask(self, name, X):
-        return (self.masks(name, self.alphas[self.toks], X.shape[1]).cpu().numpy() + dgauss(self.rng, X.shape, SIGMA) + X) & M56
+        """c = A alpha + e + X mod 2^56, all on the client's device. Returns what the server link wants: 7 bytes per
+        value (packed on the device, so only the final bytes cross to the host) or an int64 array (in-process)."""
+        if self.gen is None:                                              # device RNG, seeded from the OS-entropy rng
+            self.gen = torch.Generator(device=self.dev); self.gen.manual_seed(int(self.rng.integers(1 << 62)))
+        Xg = torch.as_tensor(X, device=self.dev)
+        e = torch.round(torch.randn(X.shape, generator=self.gen, device=self.dev, dtype=torch.float32) * SIGMA).long()
+        Aa = self.pre[name] if self.pre is not None else self.masks(name, self.alphas[self.toks], X.shape[1])
+        C = (Aa[:, :X.shape[1]] + e + Xg) & M56
+        if getattr(self.srv, "wants_bytes", False):
+            return Packed(C.contiguous().view(torch.uint8).view(-1, 8)[:, :7].contiguous().cpu().numpy().reshape(-1), tuple(C.shape))
+        return C.cpu().numpy()
 
     def single(self, name, X):
         P = self.pub[name]; S = 2.0 ** 54 / (P["rn"] * np.maximum(np.linalg.norm(X, axis=1, keepdims=True), 1e-300))

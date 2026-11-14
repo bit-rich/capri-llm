@@ -12,7 +12,7 @@ k=N: guess N tokens ahead with a local Qwen3-0.6B (helps on fast links; on a slo
 import sys, time, numpy as np, torch
 from netclient import RemoteServer, connect, cached_bundle, client_model, make_client, LWE_SEED
 import netclient
-from protocol import InnerLWE, FoldClient, forward_batch, cache_keep
+from protocol import InnerLWE, FoldClient, forward_batch, cache_keep, new_cache
 
 opt = lambda name, default=None: next((a[len(name) + 1:] for a in sys.argv if a.startswith(name + "=")), default)
 HOST, PORT, CACHE = opt("host", "127.0.0.1"), int(opt("port", 7000)), opt("cache")
@@ -57,7 +57,7 @@ def draft_propose(seq, k):
         for _ in range(k): out.append(int(dm(input_ids=torch.tensor([out[-512:]])).logits[0, -1].argmax()))
     return out[len(seq):]
 
-cache = [([], []) for _ in model.blocks]; history = []; pending = []; stats = []
+cache = new_cache(model); history = []; pending = []; stats = []
 prepare()
 if early:
     for attempt in range(180):                 # the server may still be starting: retry for up to 30 minutes
@@ -74,7 +74,7 @@ while True:
     except (EOFError, KeyboardInterrupt): break
     if not msg: continue
     if msg == "/quit": break
-    if msg == "/new": cache = [([], []) for _ in model.blocks]; history = []; pending = []; print("(new conversation)"); continue
+    if msg == "/new": cache = new_cache(model); history = []; pending = []; print("(new conversation)"); continue
     if msg == "/stats":
         for st in stats: print("  " + st)
         continue

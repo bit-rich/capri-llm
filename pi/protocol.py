@@ -311,6 +311,27 @@ class Qwen3:
             out += [(f"{i}.{k}", b[k]) for k in ("qkv", "o", "gate_up", "ob", "da", "down") if k in b]
         return out + [("head", self.head)]
 
+class KVList:
+    """Growing buffer for one layer's keys or values: behaves like the list of per-token arrays it replaces
+    (extend, append, len, del x[n:], np.asarray), but np.asarray is a view instead of a copy of the whole history."""
+    def __init__(self): self.buf, self.n = None, 0
+    def __len__(self): return self.n
+    def extend(self, rows):
+        rows = np.asarray(rows)
+        if self.buf is None: self.buf = np.empty((max(64, 2 * len(rows)),) + rows.shape[1:], rows.dtype)
+        if self.n + len(rows) > len(self.buf):
+            nb = np.empty((max(2 * len(self.buf), self.n + len(rows)),) + self.buf.shape[1:], self.buf.dtype); nb[:self.n] = self.buf[:self.n]; self.buf = nb
+        self.buf[self.n:self.n + len(rows)] = rows; self.n += len(rows)
+    def append(self, row): self.extend(np.asarray(row)[None])
+    def __delitem__(self, sl):
+        assert isinstance(sl, slice) and sl.stop is None and sl.step is None; self.n = min(self.n, sl.start)
+    def __array__(self, dtype=None, copy=None): return self.buf[:self.n] if self.buf is not None else np.empty((0,))
+    def __getitem__(self, i): return self.buf[:self.n][i]
+
+def new_cache(m):
+    """Per-layer caches: KV buffers for full attention, state lists for linear attention (rollback-able)."""
+    return [([], []) if "linear" in b else (KVList(), KVList()) for b in m.blocks]
+
 def attend(q, K, V):
     """GQA: q (hq, hd); K, V (T, hkv, hd). Query head h reads kv head h // (hq // hkv)."""
     hq, hd = q.shape; hkv = K.shape[1]
@@ -403,7 +424,7 @@ def mix(m, b, i, rows, cache, t0, cos, sin):
     q = rope(qkn(q.reshape(T, m.hq, m.hd), "q_norm"), cos, sin)
     k = rope(qkn(k.reshape(T, m.hkv, m.hd), "k_norm"), cos, sin)
     cache[i][0].extend(k); cache[i][1].extend(v.reshape(T, m.hkv, m.hd))
-    K, V = np.array(cache[i][0]), np.array(cache[i][1])
+    K, V = np.asarray(cache[i][0]), np.asarray(cache[i][1])            # a view for KVList, a copy for plain lists
     a = np.stack([attend(q[j], K[:t0 + j + 1], V[:t0 + j + 1]) for j in range(T)])
     if not m.attn_gate: return a
     return a * (silu(gate) if os.environ.get("PI_GATE") == "swish" else sigmoid(gate))   # HF: sigmoid (see gate_check.py)

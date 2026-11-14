@@ -115,7 +115,9 @@ class ChainServer:
 
 
 class ChainClient:
-    def __init__(self, srv, seed=7, dev="cuda"):
+    def __init__(self, srv, seed=None, dev="cuda"):
+        """seed=None (the default, and the only safe choice outside tests): the secrets (alphas, s, errors) come from
+        fresh operating-system entropy. A fixed seed makes them reproducible by anyone, i.e. no privacy."""
         self.srv, self.dev, self.rng = srv, dev, np.random.default_rng(seed)
         self.p, self.pub, self.W = srv.p, srv.pub, srv.W            # public (a real client gets these in the bundle)
         self.a = {n: inner_a(lid, srv.lin[n].q.shape[1]) for lid, n in enumerate(srv.order)}   # derived locally

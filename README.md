@@ -31,7 +31,8 @@ Details, derivations and every measurement are in [`pi/README.md`](pi/README.md)
 | Qwen3-4B | laptop GPU (RTX 2000 Ada, 8 GB), one token per pass | ~9 tokens/s | 4 of 4 prompts |
 | **Qwen3-32B** | **client: laptop on home internet (17 ms to AWS); server: AWS g4dn.metal (8x T4)** | **0.18 tokens/s** | 1 of 2 (the other split at a near-tie: top-2 logit gap 0.044) |
 
-- The server's extra work is about **2x** a normal int8 forward pass (Qwen3-1.7B, same GPU, compute only).
+- The server's extra work is about **1.1-1.2x** a normal int8 forward pass with v4 (`server.py v4`: Qwen3-4B 1.10x,
+  Qwen3-1.7B 1.19x, same GPU, matrix work only), and about **2x** with v3.
 - Most of the remaining slowdown is the network: about 130 round trips and about 11 MB up and 12 MB down per token
   for Qwen3-32B. That is why fewer round trips and less data per token are the main open problems.
 - "Matches plain int8" means the private run picked exactly the same tokens as the same int8 model without privacy.
@@ -42,10 +43,10 @@ Details, derivations and every measurement are in [`pi/README.md`](pi/README.md)
   that breaks the rules cannot read your prompt or the answer. What it does see is how many tokens go in and come out.
 - **Correctness does.** There is no integrity protection: a cheating server could return wrong numbers and make the
   answer wrong without the client noticing.
-- **Lattice estimates** (malb/lattice-estimator): the per-token masks (n = 1024, q = 2^32, sigma 6.4) come out at
-  about 121 bits (95 on the conservative core-SVP measure). That is below the usual 128; n = 2048 would give over 230.
-  The outer BFV scheme (N = 4096, Q = 2^80) comes out at about 175 bits. The estimator covers the underlying LWE
-  problems, not the protocol as a whole.
+- **Lattice estimates** (malb/lattice-estimator), realistic / conservative core-SVP:
+  - v4: per-token masks (n = 2048, q = 2^56, sigma 6.4) about 131 / 103 bits; outer BFV (N = 8192, Q = 2^128) 226 / 199 bits.
+  - v3: per-token masks (n = 1024, q = 2^32, sigma 6.4) about 121 / 95 bits; outer BFV (N = 4096, Q = 2^80) about 175 bits.
+  The masks are the weakest link. The estimator covers the underlying LWE problems, not the protocol as a whole.
 - **The client never takes public randomness from the server.** A server that chose the `a`'s could switch the masks off.
 - **Mixture-of-experts models need all routing hidden.** Expert selections alone reveal about 91% of tokens
   ([arXiv:2602.04105](https://arxiv.org/abs/2602.04105)). This prototype only supports dense models.

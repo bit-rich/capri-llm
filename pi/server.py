@@ -44,6 +44,7 @@ lwe = InnerLWE()
 if v4:
     assert gpu, "v4 needs a CUDA GPU"
     srv = CP.ChainServer(model); bits = CP.RB
+    if model.weights_id is None: model.weights_id = weights_hash(model, extra=f"v4 N={srv.p.N}")
 else: srv = FoldServer(model, lwe, gpu=gpu, gpu_setup=gpu, out_bits=bits)
 print(f"{repo}: loaded in {time.perf_counter() - t:.0f} s", flush=True)
 

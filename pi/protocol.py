@@ -669,6 +669,20 @@ def save_prepared(m, out, tokenizer_json):
     json.dump(meta, open(os.path.join(out, "meta.json"), "w"), indent=1)
     return meta["weights_id"]
 
+def weights_hash(m, extra=""):
+    """SHA-256 fingerprint of everything a server's one-time C1' depends on (int8 weights, scales, norm vectors), for
+    servers that don't load prepared weights. The client keys its C1' cache by it."""
+    import hashlib
+    h = hashlib.sha256(extra.encode())
+    for n, L in m.linears():
+        h.update(n.encode()); v = np.ascontiguousarray(L.q).reshape(-1).view(np.uint8)
+        for i in range(0, len(v), 1 << 30): h.update(v[i:i + (1 << 30)])
+        h.update(np.ascontiguousarray(L.scale, dtype=np.float64).tobytes())
+    for b in m.blocks:
+        for k in sorted(b):
+            if isinstance(b[k], np.ndarray): h.update(k.encode() + np.ascontiguousarray(b[k], dtype=np.float64).tobytes())
+    return h.hexdigest()[:32]
+
 def load_prepared(d):
     """Inverse of save_prepared: a Qwen3 object (all fields forward_token, forward_batch and the servers use)."""
     meta = json.load(open(os.path.join(d, "meta.json")))

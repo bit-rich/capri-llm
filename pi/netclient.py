@@ -64,16 +64,38 @@ class RemoteChainServer:
         scales = {n: s for n, s in zip(self.order, model._scales)}
         self.pub = {n: dict(rn=rn, spec=sp, scale=scales[n]) for n, (rn, sp) in v["pub"].items()}
         self.W = {r: dict(K=K, Wmax=Wm, W=w) for (r, (K, Wm)), w in zip(((r, v["W"][r]) for r in v["W_order"]), model._W)}
-        self.server_s = self.time_c1 = 0.0; self.cache = None
+        self.server_s = self.time_c1 = 0.0
+        self.cache = cache_dir and bh.get("weights_id") and os.path.join(cache_dir, "c1v4_" + bh["weights_id"])
+        self.rows = {n: shapes[n.split("@")[0]][0] for n in shapes}
 
-    def public_c1(self):
+    def public_c1(self, chunk=4096):
+        """The one-time C1', from the cache when it is complete, else from the server (saved to the cache on the way)."""
+        idx = self.cache and os.path.join(self.cache, "index.json")
+        if idx and os.path.exists(os.path.join(self.cache, "complete")):
+            for kind, name, rows in json.load(open(idx)):
+                mm = np.load(os.path.join(self.cache, name + ".npy"), mmap_mode="r")
+                assert mm.shape == (rows, self.p.N)
+                for r0 in range(0, rows, chunk): yield kind, name, r0, torch.from_numpy(mm[r0:r0 + chunk].astype(np.int64))
+            return
+        files, index = {}, []
+        if self.cache: os.makedirs(self.cache, exist_ok=True)
         t = time.perf_counter(); self.c.send(dict(op="c1"))
         while True:
             h, a = self.c.recv()
             if h["op"] == "c1done": break
             self.time_c1 += time.perf_counter() - t
-            yield h["kind"], h["name"], h["r0"], torch.from_numpy(a[0].astype(np.int64))
+            kind, name, r0 = h["kind"], h["name"], h["r0"]
+            if self.cache:
+                if name not in files:
+                    rows = self.rows[name.split("@")[0]]
+                    files[name] = np.lib.format.open_memmap(os.path.join(self.cache, name + ".npy"), "w+", a[0].dtype, (rows, self.p.N))
+                    index.append([kind, name, rows])
+                files[name][r0:r0 + len(a[0])] = a[0]
+            yield kind, name, r0, torch.from_numpy(a[0].astype(np.int64))
             t = time.perf_counter()
+        if self.cache:
+            for f in files.values(): f.flush()
+            json.dump(index, open(idx, "w")); open(os.path.join(self.cache, "complete"), "w").close()
 
     def receive_b(self, b):
         self.c.send(dict(op="b"), [b]); assert self.c.recv()[0]["op"] == "ok"

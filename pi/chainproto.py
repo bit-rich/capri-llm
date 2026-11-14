@@ -206,4 +206,5 @@ class ChainClient:
                 rv, qkv = self.pair(f"{i}.down", f"{i + 1}.qkv", h, m.blocks[i + 1]["ln1"] * x)
                 x = x + rv; qkv = qkv / rms(x)
             else: x = x + self.single(f"{i}.down", h)
+        self.last_x = x                                   # final hidden states (pre-norm), e.g. for an EAGLE draft
         return self.single("head", rmsnorm(x[-(n_head or T):], m.norm, m.eps))

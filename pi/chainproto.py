@@ -16,8 +16,32 @@ from fold import NegFFT
 from protocol import dgauss, bf16_to_f32, rmsnorm, silu, mix, _angles
 
 M56, HALF = F.M56, 1 << 55
-N_LWE, SIGMA, WB, RB = 2048, 6.4, 8, 24          # inner ring, error, bits of W, reply bits of single/chain rows
+import os
+N_LWE, SIGMA, WB = 2048, 6.4, 8                  # inner ring, error, bits of W
+RB = int(os.environ.get("PI_RB", 20))             # reply bits of single/chain rows
 SH = 55 - RB                                      # reply = bits SH..54 of y
+RBR = int(os.environ.get("PI_RBR", 28))           # residual-row reply bits
+PREC = int(os.environ.get("PI_PREC", 8))          # kept precision bits of every upload value (8: no measurable loss)
+
+def compression(pub, W, pairs, singles, din):
+    """Public bit budgets (modulus switching), from public norms only, so they reveal nothing about the inputs.
+    Uploads: drop the low k bits of each masked value (k a multiple of 8: whole bytes), keeping about PREC bits below
+    the largest per-entry size the client's scaling allows; the rounding just adds to the LWE error.
+    Residual replies: send bits [lo, lo + RBR) of t, the only ones its public bound allows to be non-noise."""
+    import math
+    kb = lambda bits_free: max(0, int(bits_free) - PREC) // 8 * 8
+    out = {}
+    for n in singles: out[n] = kb(54 - math.log2(pub[n]["rn"]) - 0.5 * math.log2(din[n]))
+    for r, g in pairs:
+        chain = math.log2(pub[g]["rn"] * W[r]["Wmax"] * pub[r]["spec"])            # |v~| <= 2^54 / chain
+        out[r] = kb(54 - chain - 0.5 * math.log2(din[r]))
+        out[g] = kb(54 - math.log2(pub[g]["rn"]) - 0.5 * math.log2(din[g]))
+        hb = math.ceil(math.log2(pub[r]["rn"]) + 54 - chain) + 1                       # |t| < 2^hb
+        out[r + "@lo"] = max(0, hb - RBR)
+    return out
+
+def centre_m(v, m):                               # value known mod 2^m, |value| < 2^(m-1)
+    return ((v + (1 << (m - 1))) & ((1 << m) - 1)) - (1 << (m - 1))
 
 def centre(v): return ((v + HALF) & M56) - HALF
 def centre55(v):                                  # 24-bit replies carry bits SH..54: the value is known mod 2^55, |value| < 2^54
@@ -71,6 +95,8 @@ class ChainServer:
         for r, g, w in self.pairs:
             ws = w * self.lin[r].scale; K = (2 ** WB - 1) / np.abs(ws).max(); Wi = np.rint(K * ws).astype(np.int64)
             self.W[r] = dict(K=float(K), W=Wi, Wmax=float(np.abs(Wi).max()), Wg=torch.as_tensor(Wi, device=dev))
+        self.comp = compression(self.pub, self.W, [(r, g) for r, g, _ in self.pairs], self.singles,
+                                {n: L.q.shape[1] for n, L in self.lin.items()})
         self.a_pub = F.public_a(self.p)
         self.pads = F.Pads(self.p, [self.a[n] for n in self.order], [self.lin[n].q.shape[1] for n in self.order], dev)
         self.hint = None; self.time_online = self.time_pads = self.time_c1 = 0.0
@@ -112,15 +138,17 @@ class ChainServer:
 
     def single(self, name, toks, C):
         t0 = time.perf_counter(); u = self._pads(toks)
-        y = self._mm(self.Wg[name], torch.as_tensor(C, device=self.dev), u(name))
+        y = self._mm(self.Wg[name], torch.as_tensor(C, device=self.dev) << self.comp[name], u(name))
         out = (((y + (1 << (SH - 1))) >> SH) & ((1 << RB) - 1)).cpu().numpy()
         self.time_online += time.perf_counter() - t0; return out
 
     def pair(self, r, g, toks, Cv, Cx):
         t0 = time.perf_counter(); u = self._pads(toks)
-        t = self._mm(self.Wg[r], torch.as_tensor(Cv, device=self.dev), u(r))
-        y = self._mm(self.Wg[g], (self.W[r]["Wg"] * t + torch.as_tensor(Cx, device=self.dev)) & M56, u(g))
-        out = t.cpu().numpy(), (((y + (1 << (SH - 1))) >> SH) & ((1 << RB) - 1)).cpu().numpy()
+        t = self._mm(self.Wg[r], torch.as_tensor(Cv, device=self.dev) << self.comp[r], u(r))
+        y = self._mm(self.Wg[g], (self.W[r]["Wg"] * t + (torch.as_tensor(Cx, device=self.dev) << self.comp[g])) & M56, u(g))
+        lo = self.comp[r + "@lo"]
+        tw = ((t + ((1 << (lo - 1)) if lo else 0)) >> lo) & ((1 << RBR) - 1)          # bits lo .. lo + RBR of t
+        out = tw.cpu().numpy(), (((y + (1 << (SH - 1))) >> SH) & ((1 << RB) - 1)).cpu().numpy()
         self.time_online += time.perf_counter() - t0; return out
 
 
@@ -138,6 +166,8 @@ class ChainClient:
         self.p, self.pub, self.W = srv.p, srv.pub, srv.W            # public (a real client gets these in the bundle)
         self.a = {n: inner_a(lid, srv.lin[n].q.shape[1]) for lid, n in enumerate(srv.order)}   # derived locally
         self.masks = Masks(self.a, dev)
+        self.comp = compression(self.pub, self.W, [tuple(p) for p in getattr(srv, "pair_list", [])] or
+                                [(r, g) for r, g, _ in srv.pairs], srv.singles, {n: srv.lin[n].q.shape[1] for n in srv.order})
         self.rounds = 0; self.up = self.down = 0; self.t_client = 0.0
 
     def offline(self, n_tokens):
@@ -170,8 +200,11 @@ class ChainClient:
         e = torch.round(torch.randn(X.shape, generator=self.gen, device=self.dev, dtype=torch.float32) * SIGMA).long()
         Aa = self.pre[name] if self.pre is not None else self.masks(name, self.alphas[self.toks], X.shape[1])
         C = (Aa[:, :X.shape[1]] + e + Xg) & M56
+        k = self.comp[name]
+        if k: C = ((C + (1 << (k - 1))) >> k) & ((1 << (56 - k)) - 1)                  # modulus switch: drop k low bits
         if getattr(self.srv, "wants_bytes", False):
-            return Packed(C.contiguous().view(torch.uint8).view(-1, 8)[:, :7].contiguous().cpu().numpy().reshape(-1), tuple(C.shape))
+            nb = (56 - k) // 8
+            return Packed(C.contiguous().view(torch.uint8).view(-1, 8)[:, :nb].contiguous().cpu().numpy().reshape(-1), tuple(C.shape))
         return C.cpu().numpy()
 
     def single(self, name, X):
@@ -179,7 +212,7 @@ class ChainClient:
         C = self._mask(name, np.rint(X * S).astype(np.int64))
         y = self.srv.single(name, self.toks, C)                           # ---- round trip ----
         r = centre55((y << SH) - self.z[name][self.toks])
-        self.rounds += 1; self.up += 7 * C.size; self.down += RB / 8 * y.size
+        self.rounds += 1; self.up += (56 - self.comp[name]) / 8 * C.size; self.down += RB / 8 * y.size
         return r / S * P["scale"]
 
     def pair(self, r, g, v, wx):
@@ -188,8 +221,10 @@ class ChainClient:
         S = 2.0 ** 54 / (G["rn"] * np.maximum(bound, 1e-300))
         Cv = self._mask(r, np.rint(v * S).astype(np.int64)); Cx = self._mask(g, np.rint(wx * Wd["K"] * S).astype(np.int64))
         t, y = self.srv.pair(r, g, self.toks, Cv, Cx)                     # ---- round trip ----
-        rt = centre(t - self.z[r][self.toks]); ry = centre55((y << SH) - self.z[g + "@" + r][self.toks])
-        self.rounds += 1; self.up += 7 * (Cv.size + Cx.size); self.down += 7 * t.size + RB / 8 * y.size
+        lo = self.comp[r + "@lo"]
+        rt = centre_m((t << lo) - self.z[r][self.toks], lo + RBR); ry = centre55((y << SH) - self.z[g + "@" + r][self.toks])
+        self.rounds += 1; self.up += (56 - self.comp[r]) / 8 * Cv.size + (56 - self.comp[g]) / 8 * Cx.size
+        self.down += RBR / 8 * t.size + RB / 8 * y.size
         return rt / S * R["scale"], ry / (Wd["K"] * S) * G["scale"]
 
     def forward(self, toks, cache, n_head=None):

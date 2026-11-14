@@ -65,7 +65,8 @@ def bundle():
     if v4:                                                     # public numbers the v4 client scales with, + the W multipliers
         hdr["v4"] = dict(n=CP.N_LWE, N=srv.p.N, inner_seed=21, a_pub_seed=3, pairs=[[r, g] for r, g, _ in srv.pairs],
                          singles=srv.singles, pub={k: [v["rn"], v["spec"]] for k, v in srv.pub.items()},
-                         W={r: [w["K"], w["Wmax"]] for r, w in srv.W.items()}, W_order=[r for r, _, _ in srv.pairs])
+                         W={r: [w["K"], w["Wmax"]] for r, w in srv.W.items()}, W_order=[r for r, _, _ in srv.pairs],
+                         bits=dict(RB=CP.RB, RBR=CP.RBR, PREC=CP.PREC))
         arrays += [srv.W[r]["W"].astype(np.int64) for r, _, _ in srv.pairs]
     return hdr, arrays
 
@@ -126,16 +127,16 @@ def serve(c):
             for r0, rows in c1_rows(h["name"]): c.send(dict(op="c1chunk", r0=r0), [rows])
             c.send(dict(op="c1done"))
         elif op == "single":                                   # v4
-            t0 = time.perf_counter(); C = unpack_bits(a[0], 56, int(np.prod(h["shape"]))).reshape(h["shape"])
+            t0 = time.perf_counter(); C = unpack_bits(a[0], 56 - srv.comp[h["name"]], int(np.prod(h["shape"]))).reshape(h["shape"])
             y = srv.single(h["name"], np.asarray(h["toks"]), C)
             c.send(dict(op="y", shape=list(y.shape), server_s=time.perf_counter() - t0), [pack_bits(y, CP.RB)])
         elif op == "pair":                                     # v4
             t0 = time.perf_counter()
-            Cv = unpack_bits(a[0], 56, int(np.prod(h["shape_v"]))).reshape(h["shape_v"])
-            Cx = unpack_bits(a[1], 56, int(np.prod(h["shape_x"]))).reshape(h["shape_x"])
+            Cv = unpack_bits(a[0], 56 - srv.comp[h["r"]], int(np.prod(h["shape_v"]))).reshape(h["shape_v"])
+            Cx = unpack_bits(a[1], 56 - srv.comp[h["g"]], int(np.prod(h["shape_x"]))).reshape(h["shape_x"])
             t, y = srv.pair(h["r"], h["g"], np.asarray(h["toks"]), Cv, Cx)
             c.send(dict(op="ty", shape_t=list(t.shape), shape_y=list(y.shape), server_s=time.perf_counter() - t0),
-                   [pack_bits(t, 56), pack_bits(y, CP.RB)])
+                   [pack_bits(t, CP.RBR), pack_bits(y, CP.RB)])
         elif op == "b": srv.receive_b(a[0]); srv.pos = (); c.send(dict(op="ok"))
         elif op == "lin":
             t0 = time.perf_counter(); y = srv.online_batch(h["name"], np.asarray(h["toks"]), a[0])

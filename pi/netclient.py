@@ -64,6 +64,8 @@ class RemoteChainServer:
         scales = {n: s for n, s in zip(self.order, model._scales)}
         self.pub = {n: dict(rn=rn, spec=sp, scale=scales[n]) for n, (rn, sp) in v["pub"].items()}
         self.W = {r: dict(K=K, Wmax=Wm, W=w) for (r, (K, Wm)), w in zip(((r, v["W"][r]) for r in v["W_order"]), model._W)}
+        self.pair_list, self.singles = [tuple(p) for p in v["pairs"]], v["singles"]
+        assert v.get("bits") == dict(RB=CP.RB, RBR=CP.RBR, PREC=CP.PREC), "server uses different bit budgets"
         self.server_s = self.time_c1 = 0.0
         self.cache = cache_dir and bh.get("weights_id") and os.path.join(cache_dir, "c1v4_" + bh["weights_id"])
         self.rows = {n: shapes[n.split("@")[0]][0] for n in shapes}
@@ -102,7 +104,7 @@ class RemoteChainServer:
 
     wants_bytes = True                                      # the client packs uploads on its GPU
 
-    def _bytes(self, C): return C.data if hasattr(C, "data") and not isinstance(C, np.ndarray) else pack_bits(C, 56)
+    def _bytes(self, C, bits=56): return C.data if hasattr(C, "data") and not isinstance(C, np.ndarray) else pack_bits(C, bits)
 
     def single(self, name, toks, C):
         self.c.send(dict(op="single", name=name, toks=[int(t) for t in toks], shape=list(C.shape)), [self._bytes(C)])
@@ -113,7 +115,7 @@ class RemoteChainServer:
         self.c.send(dict(op="pair", r=r, g=g, toks=[int(t) for t in toks], shape_v=list(Cv.shape), shape_x=list(Cx.shape)),
                     [self._bytes(Cv), self._bytes(Cx)])
         h, a = self.c.recv(); self.server_s += h["server_s"]
-        return (unpack_bits(a[0], 56, int(np.prod(h["shape_t"]))).reshape(h["shape_t"]),
+        return (unpack_bits(a[0], self.CP.RBR, int(np.prod(h["shape_t"]))).reshape(h["shape_t"]),
                 unpack_bits(a[1], self.CP.RB, int(np.prod(h["shape_y"]))).reshape(h["shape_y"]))
 
 
